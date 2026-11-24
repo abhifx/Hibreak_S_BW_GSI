@@ -17,3 +17,7 @@ eink-center/debug.keystore
 *.png
 *.log
 *.pb
+
+# screenshots linked from the README
+!docs/screenshots/
+!docs/screenshots/*.png

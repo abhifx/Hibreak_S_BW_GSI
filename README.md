@@ -26,6 +26,20 @@ build path are in `docs/` — this repo exists so someone can pick that up.
 Nothing here requires unlocking the bootloader. The shim is bind-mounted at runtime
 and `adb reboot` restores the stock vendor composer.
 
+## Screenshots
+
+SurfaceFlinger screencaps from the phone (720x1440). The panel itself is monochrome
+and dithered, so this is what the UI is composed as, not a photograph of the e-ink.
+
+| | |
+|---|---|
+| ![Home](docs/screenshots/home.png) | ![E-ink Center](docs/screenshots/einkcenter.png) |
+| Launcher3 as home | E-ink Center: modes, composer fps, front light |
+| ![Settings](docs/screenshots/settings.png) | |
+| Settings | |
+
+
+
 ## What works today
 
 1. **E-ink stack initialisation (biggest quality win).** The GSI never sets the stock
