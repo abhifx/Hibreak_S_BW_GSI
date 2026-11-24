@@ -2,6 +2,9 @@
 
 ## Known-good image (what this work was measured on)
 
+**Download:** https://github.com/abhifx/Hibreak_S_BW_GSI/releases/download/v1.0.0/system-td-arm64-vanilla.img.gz
+(release: https://github.com/abhifx/Hibreak_S_BW_GSI/releases/tag/v1.0.0)
+
 | | |
 |---|---|
 | file | `system-td-arm64-vanilla.img` |
