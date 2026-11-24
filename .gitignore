@@ -1,0 +1,19 @@
+# build outputs
+**/out/
+**/build/
+**/build-win/
+*.o
+*.so
+*.apk
+*.idsig
+
+# never publish these
+real/
+eink-center/debug.keystore
+*.img
+*.zip
+
+# local artifacts
+*.png
+*.log
+*.pb
