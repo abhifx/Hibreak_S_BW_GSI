@@ -8,7 +8,7 @@
 | raw size | 2.06 GB |
 | gzip (for the DSU installer) | `system-td-arm64-vanilla.img.gz`, 1.01 GB |
 | sha256 raw | `a0704a7909328cc077f314f25ed47c5ce02b4a095cc932dd36060e4a90d333a8` |
-| sha256 gz | `d06c66e45c6d1e8d61b45d1261a65cb7ccf2e7946739602011e500a12ae55ad6` |
+| sha256 gz (locally produced, `gzip -1`) | `2df4b1a0a005195cba5e0bf271543f1e69ceb6b991fb8585a222e80875bed266` |
 | build | TrebleDroid `treble_arm64_bvS`, Android 16 `BP2A.250605.031.A3`, userdebug |
 
 Do **not** use `system-td-eink.img` from earlier experiments: it is a custom baked
