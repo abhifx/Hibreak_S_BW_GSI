@@ -1,24 +1,25 @@
 package com.hibreak.einkcenter;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
+import java.util.UUID;
 
-/** Thin wrapper around phh's su. */
+/** Thin wrapper around phh's su, backed by the process-wide root shell. */
 public final class Root {
 
     private Root() { }
 
     public static String run(String cmd) {
+        if (cmd == null || cmd.isEmpty()) return "";
+        String marker = "__ROOT_STATUS_" + UUID.randomUUID() + "__";
         try {
-            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
-            StringBuilder sb = new StringBuilder();
-            BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            String line;
-            while ((line = r.readLine()) != null) sb.append(line).append('\n');
-            BufferedReader er = new BufferedReader(new InputStreamReader(p.getErrorStream()));
-            while ((line = er.readLine()) != null) sb.append(line).append('\n');
-            p.waitFor();
-            return sb.toString().trim();
+            String out = RootShell.get().query(
+                    cmd + "\n__root_rc=$?; printf '\\n" + marker + "%d\\n' \"$__root_rc\"",
+                    8_000);
+            int at = out.indexOf(marker);
+            if (at < 0) return "ERR root command timed out";
+            String stdout = out.substring(0, at).trim();
+            int rc = Integer.parseInt(out.substring(at + marker.length()).trim());
+            if (rc == 0) return stdout;
+            return stdout.isEmpty() ? "ERR exit " + rc : stdout + "\nERR exit " + rc;
         } catch (Exception e) {
             return "ERR " + e;
         }

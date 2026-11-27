@@ -1,4 +1,13 @@
-# Building a system image (the 60 fps route)
+# Building a system image (historical 60 fps route)
+
+> **2026-11-25:** visible 60 fps is now achieved without a system build using the
+> reversible `xproc_vendor=1` HWC/helper overlay; see `STATUS.md`. This document is
+> retained for the alternative source-build route.
+
+> **2026-11-24:** see `SF-COMPATIBILITY-AUDIT.md` for the exact source branch and a
+> rebased core patch. The published Pro `0013` patch keeps RGBA_8888; it is not proof
+> of a 4 MB → 1 MB optimization. Build from the TrebleDroid fork, not HBPC/LineageOS
+> binaries, and measure the client-target format and `processImage` time.
 
 Two shapes, both possible without unlocking the bootloader:
 

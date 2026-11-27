@@ -22,10 +22,13 @@ echo "==> d8"
 mapfile -t CLASSES < <(find "$OUT/classes" -name '*.class')
 "$BT/d8" --lib "$PLATFORM" --min-api 30 --output "$OUT/dex" "${CLASSES[@]}"
 
+echo "==> aapt2 compile resources"
+"$BT/aapt2" compile --dir "$HERE/res" -o "$OUT/compiled.zip"
+
 echo "==> aapt2 link"
 "$BT/aapt2" link -o "$OUT/base.apk" -I "$PLATFORM" \
     --manifest "$HERE/AndroidManifest.xml" \
-    --min-sdk-version 30 --target-sdk-version 34
+    --min-sdk-version 30 --target-sdk-version 34 "$OUT/compiled.zip"
 
 echo "==> add dex"
 ( cd "$OUT/dex" && zip -q "$OUT/base.apk" classes.dex )

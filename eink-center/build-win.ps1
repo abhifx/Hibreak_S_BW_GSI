@@ -33,10 +33,15 @@ $classes = Get-ChildItem (Join-Path $out 'classes') -Recurse -Filter *.class | F
 & (Join-Path $bt 'd8.bat') --lib $jar --min-api 30 --output (Join-Path $out 'dex') @classes
 if ($LASTEXITCODE -ne 0) { throw "d8 failed" }
 
+Write-Host "==> aapt2 compile resources"
+$compiled = Join-Path $out 'compiled.zip'
+& (Join-Path $bt 'aapt2.exe') compile --dir (Join-Path $here 'res') -o $compiled
+if ($LASTEXITCODE -ne 0) { throw "aapt2 resource compile failed" }
+
 Write-Host "==> aapt2 link"
 & (Join-Path $bt 'aapt2.exe') link -o (Join-Path $out 'base.apk') -I $jar `
     --manifest (Join-Path $here 'AndroidManifest.xml') `
-    --min-sdk-version 30 --target-sdk-version 34
+    --min-sdk-version 30 --target-sdk-version 34 $compiled
 if ($LASTEXITCODE -ne 0) { throw "aapt2 failed" }
 
 Write-Host "==> add dex"

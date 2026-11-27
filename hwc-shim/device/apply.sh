@@ -19,6 +19,44 @@ SRC=/vendor/lib64/hw
 M=/system/xbin/hwmirror
 D=/data/local/tmp/hwc-shim-mt6765
 
+case "$LAYOUT" in
+    variant|replace|none) ;;
+    *) echo "unknown layout $LAYOUT"; exit 2 ;;
+esac
+case "$WAIT" in
+    ''|*[!0-9]*) echo "watchdog delay must be an integer"; exit 2 ;;
+esac
+if [ "$WAIT" -lt 5 ] || [ "$WAIT" -gt 600 ]; then
+    echo "watchdog delay must be 5..600 seconds"; exit 2
+fi
+if [ "$(getenforce 2>/dev/null)" != "Enforcing" ]; then
+    echo "refusing: SELinux is not Enforcing"; exit 1
+fi
+if grep -q " $M " /proc/mounts; then
+    echo "refusing: $M is still a mountpoint"; exit 1
+fi
+
+ctx_of() {
+    ls -ldZ "$1" 2>/dev/null | awk '{print $5}'
+}
+copy_labeled() {
+    src=$1
+    dst=$2
+    ctx=$(ctx_of "$src")
+    if [ -z "$ctx" ]; then echo "missing SELinux context: $src"; exit 1; fi
+    if [ -L "$src" ]; then
+        # Label the link itself; its relative target may not have been copied
+        # yet, and following a dangling link would fail with ENOENT.
+        chcon -h "$ctx" "$dst" || { echo "chcon -h failed: $dst <- $ctx"; exit 1; }
+    else
+        chcon "$ctx" "$dst" || { echo "chcon failed: $dst <- $ctx"; exit 1; }
+    fi
+    got=$(ctx_of "$dst")
+    if [ "$got" != "$ctx" ]; then
+        echo "label verification failed: $dst got '$got' expected '$ctx'"; exit 1
+    fi
+}
+
 umount $SRC 2>/dev/null
 # A plain umount can fail with EBUSY while the composer still has the old files
 # mapped; -l detaches the mount from the namespace, which is all we need.
@@ -37,34 +75,72 @@ n=0
 for f in $SRC/*; do
     b=$(basename "$f")
     cp -a "$f" "$M/$b" || { echo "copy failed: $b"; exit 1; }
-    ctx=$(ls -lZ "$f" 2>/dev/null | awk '{print $5}')
-    if [ -n "$ctx" ]; then chcon "$ctx" "$M/$b" 2>/dev/null; fi
+    copy_labeled "$f" "$M/$b"
     n=$((n + 1))
 done
-dctx=$(ls -ldZ $SRC 2>/dev/null | awk '{print $5}')
-[ -n "$dctx" ] && chcon "$dctx" "$M" 2>/dev/null
+copy_labeled "$SRC" "$M"
+
+for b in gralloc.rogue.so gralloc.default.so \
+         android.hardware.graphics.mapper@4.0-impl-mediatek.so vulkan.mt6765.so; do
+    if [ ! -e "$SRC/$b" ]; then echo "missing critical vendor module: $b"; exit 1; fi
+    ctx=$(ctx_of "$M/$b")
+    if [ -z "$ctx" ]; then echo "critical module has no context: $b"; exit 1; fi
+done
 
 case "$LAYOUT" in
     variant)
         cp $D/hwcshim.mt6765.so $M/hwcomposer.mtk_common.so || exit 1
-        chcon u:object_r:vendor_file:s0 $M/hwcomposer.mtk_common.so
+        # The composer service is not root. Do not inherit a restrictive umask
+        # from an E-ink Center su shell when persistence runs this at boot.
+        chmod 644 $M/hwcomposer.mtk_common.so || exit 1
+        chcon u:object_r:vendor_file:s0 $M/hwcomposer.mtk_common.so || {
+            echo "chcon failed: shim"; exit 1; }
+        [ "$(ctx_of $M/hwcomposer.mtk_common.so)" = "u:object_r:vendor_file:s0" ] || {
+            echo "shim label verification failed"; exit 1; }
         ;;
     replace)
+        realctx=$(ctx_of "$M/hwcomposer.mt6765.so")
+        if [ -z "$realctx" ]; then echo "missing original composer context"; exit 1; fi
         [ -f $M/hwcomposer.mt6765.real.so ] || cp -a $M/hwcomposer.mt6765.so $M/hwcomposer.mt6765.real.so
+        chcon "$realctx" $M/hwcomposer.mt6765.real.so || {
+            echo "real composer label restore failed"; exit 1; }
         cp $D/hwcshim.mt6765.so $M/hwcomposer.mt6765.so || exit 1
-        chcon u:object_r:vendor_file:s0 $M/hwcomposer.mt6765.so $M/hwcomposer.mt6765.real.so
+        chmod 644 $M/hwcomposer.mt6765.so || exit 1
+        chcon u:object_r:vendor_file:s0 $M/hwcomposer.mt6765.so || {
+            echo "chcon failed: shim"; exit 1; }
+        [ "$(ctx_of $M/hwcomposer.mt6765.so)" = "u:object_r:vendor_file:s0" ] || {
+            echo "shim label verification failed"; exit 1; }
+        [ "$(ctx_of $M/hwcomposer.mt6765.real.so)" = "$realctx" ] || {
+            echo "real composer label verification failed"; exit 1; }
         ;;
     none) : ;;
-    *) echo "unknown layout $LAYOUT"; exit 2 ;;
 esac
 
 mount --bind $M $SRC || { echo "mount failed"; exit 1; }
+grep -q " $SRC " /proc/mounts || { echo "bind mount is not visible"; exit 1; }
 
 echo "layout=$LAYOUT files=$n"
 ls -lZ $M | grep -E "gralloc|vulkan|mapper|hwcomposer" | awk '{print "  " $5, $9}'
 
 SS0=$(pidof system_server)
 nohup sh $D/watchdog.sh "$WAIT" >/dev/null 2>&1 &
+wd=$!
+sleep 1
+if ! kill -0 "$wd" 2>/dev/null; then
+    echo "watchdog failed to start"; exit 1
+fi
+
+# Preserve the first pre-deployment e-ink sysfs state for same-boot -Revert.
+STATE=$D/eink-debug-before.env
+if [ ! -f "$STATE" ]; then
+    : > "$STATE"
+    for f in clean_a2 anti_flicker; do
+        p=/sys/kernel/debug/eink_debug/$f
+        if [ -e "$p" ]; then
+            printf '%s=%s\n' "$f" "$(cat $p 2>/dev/null)" >> "$STATE"
+        fi
+    done
+fi
 
 # Kernel e-ink knobs that the stock framework initialises but a GSI does not.
 # From the HiBreak Pro LineageOS device tree (init.hibreakpro.eink.rc):
@@ -74,7 +150,7 @@ for f in clean_a2 anti_flicker; do
     p=/sys/kernel/debug/eink_debug/$f
     if [ -e "$p" ]; then
         echo "eink_debug $f: $(cat $p 2>/dev/null) -> 1"
-        echo 1 > "$p" 2>/dev/null
+        echo 1 > "$p" 2>/dev/null || echo "warning: could not write $p"
     fi
 done
 
@@ -88,7 +164,19 @@ logcat -c
 setprop ctl.restart vendor.hwcomposer-2-1
 sleep 3
 setprop ctl.restart zygote
-sleep 3
 
-echo "ss=$(pidof system_server) sf=$(pidof surfaceflinger) composer=$(pidof android.hardware.graphics.composer@2.1-service)"
+i=0
+while [ $i -lt 20 ]; do
+    cp=$(pidof android.hardware.graphics.composer@2.1-service)
+    sf=$(pidof surfaceflinger)
+    if [ -n "$cp" ] && [ -n "$sf" ]; then break; fi
+    sleep 1
+    i=$((i + 1))
+done
+if [ -z "${cp:-}" ] || [ -z "${sf:-}" ]; then
+    echo "display stack did not come back (sf=${sf:-none} composer=${cp:-none})"
+    exit 1
+fi
+
+echo "ss=$(pidof system_server) sf=$sf composer=$cp"
 echo "watchdog: system_server was $SS0 (a zygote restart is expected to change it)"

@@ -71,6 +71,8 @@ public class MainActivity extends Activity {
     private final Map<String, Button> modeButtons = new LinkedHashMap<>();
 
     private TextView status;
+    private TextView floatingStatus;
+    private Button bubbleButton;
     private TextView log;
     private EditText fpsBase;
     private EditText fpsHigh;
@@ -81,10 +83,14 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        EinkUi.prepareActivity(this);
 
         ScrollView sv = new ScrollView(this);
+        sv.setBackgroundColor(EinkUi.WHITE);
+        sv.setOverScrollMode(View.OVER_SCROLL_NEVER);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(EinkUi.WHITE);
         root.setPadding(dp(12), dp(12), dp(12), dp(24));
         sv.addView(root);
         setContentView(sv);
@@ -96,6 +102,27 @@ public class MainActivity extends Activity {
         status.setLineSpacing(dp(3), 1f);
         st.addView(status);
         row(st, button("Fix panel", this::fixPanel), button("Full refresh", this::fullRefresh));
+
+        // ------------------------------------------ floating and per-app profiles
+        LinearLayout fp = card(root, "Floating & per-app");
+        floatingStatus = text("");
+        floatingStatus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        floatingStatus.setLineSpacing(dp(3), 1f);
+        floatingStatus.setPadding(dp(2), 0, dp(2), dp(4));
+        fp.addView(floatingStatus);
+        row(fp, EinkUi.button(this, "Enable accessibility service", () -> startActivity(
+                        new android.content.Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS))),
+                EinkUi.button(this, "Per-app modes", () -> startActivity(
+                        new android.content.Intent(this, ProfileActivity.class))));
+        bubbleButton = EinkUi.button(this, "", () -> {
+            ProfileStore.setBubbleEnabled(this, !ProfileStore.bubbleEnabled(this));
+            updateFloatingCard();
+        });
+        row(fp, EinkUi.button(this, "Extra hardware button", () -> startActivity(
+                        new android.content.Intent(this, ButtonSettingsActivity.class))), bubbleButton);
+        caption(fp, "The bubble is optional and off by default. Open the panel any time from "
+                + "the E-ink Quick Settings tile or by double-pressing the extra button. "
+                + "No overlay permission is needed.");
 
         // --------------------------------------------------------- refresh
         LinearLayout rf = card(root, "Refresh");
@@ -155,6 +182,18 @@ public class MainActivity extends Activity {
                             ? "Add JPG/PNG/WebP to Pictures/EinkWallpapers"
                             : wcount[0] + " images - a new one on every lock");
                 }));
+        Switch sleepWallpaper = new Switch(this);
+        sleepWallpaper.setText("Sleep wallpaper");
+        sleepWallpaper.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        EinkUi.styleSwitch(sleepWallpaper);
+        sleepWallpaper.setChecked(ProfileStore.sleepWallpaperEnabled(this));
+        sleepWallpaper.setOnCheckedChangeListener((v, on) -> {
+            ProfileStore.setSleepWallpaperEnabled(this, on);
+            note("sleep wallpaper=" + on);
+        });
+        lw.addView(sleepWallpaper);
+        caption(lw, "Optional: show the next e-ink wallpaper as a one-shot sleep frame, "
+                + "then power off into deep doze. Requires the accessibility service.");
 
         // --------------------------------------------------------- picture
         LinearLayout pn = card(root, "Picture");
@@ -185,20 +224,28 @@ public class MainActivity extends Activity {
 
         // --------------------------------------------------------- systemui
         LinearLayout ui = card(root, "SystemUI (e-ink)");
+        row(ui, EinkUi.solidButton(this, "Apply complete E-ink UI",
+                        () -> run(EinkUiPreset.applyCommand(), "complete E-ink UI applied")),
+                EinkUi.button(this, "Restore Android UI defaults",
+                        () -> run(EinkUiPreset.restoreCommand(), "Android UI defaults restored")));
+        caption(ui, "Preset: light theme, high contrast off, no animations/blur/heads-up, "
+                + "no smooth fling, gesture navigation and vendor animation off. "
+                + "Restore keeps the current navigation mode.");
         settingToggle(ui, "Opaque shade (no blurs)", "s.blurs", true);
         settingToggle(ui, "High text contrast", "s.contrast", true);
         settingToggle(ui, "No animations", "s.anim", false);
-        caption(ui, "Applied through Settings; SystemUI picks them up immediately.");
+        caption(ui, "Individual controls below update immediately; the boot preset reapplies the complete set.");
 
         // ---------------------------------------------------------- system
         LinearLayout sy = card(root, "System");
         Switch sync = new Switch(this);
         sync.setText("Input sync (auto-clean cadence)");
         sync.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        sync.setPadding(dp(2), dp(8), 0, dp(8));
+        EinkUi.styleSwitch(sync);
         boolean on = getPreferences(MODE_PRIVATE).getBoolean("input_sync", true);
         sync.setChecked(on);
         sync.setOnCheckedChangeListener((btn, checked) -> {
+            sync.jumpDrawablesToCurrentState();
             getPreferences(MODE_PRIVATE).edit().putBoolean("input_sync", checked).apply();
             if (checked) startForegroundService(new android.content.Intent(this, EinkDaemonService.class));
             else stopService(new android.content.Intent(this, EinkDaemonService.class));
@@ -228,6 +275,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        updateFloatingCard();
         if (getPreferences(MODE_PRIVATE).getBoolean("input_sync", true) && !daemonStarted) {
             daemonStarted = true;
             try {
@@ -261,15 +309,36 @@ public class MainActivity extends Activity {
     }
 
     private void fullRefresh() {
-        run("input keyevent 26; sleep 1; input keyevent 26; "
-                + "service call SurfaceFlinger 1008 i32 1", "full refresh");
+        bg(() -> {
+            boolean ok = EinkController.fullRefresh(this);
+            note("full refresh " + (ok ? "(ok)" : "(failed)"));
+            reloadBlocking();
+        });
     }
 
     private void setMode(String mode) {
-        run("setprop vendor.xrz.force_global_refresh_mode 0; "
-                + "setprop vendor.xrz.global_refresh_mode " + mode + "; "
-                + "echo " + mode + " > " + EINK + "/global_mode",
-                "refresh_mode=" + mode);
+        if (!EinkController.isValidMode(mode)) {
+            note("invalid refresh mode: " + mode);
+            return;
+        }
+        bg(() -> {
+            boolean ok = EinkController.apply(this, mode);
+            if (ok) ProfileStore.setGlobalMode(this, mode);
+            note("refresh_mode=" + mode + (ok ? " (ok)" : " (failed)"));
+            reloadBlocking();
+        });
+    }
+
+    private void updateFloatingCard() {
+        if (floatingStatus == null || bubbleButton == null) return;
+        boolean settingEnabled = EinkAccessibilityService.enabledInSettings(this);
+        boolean running = EinkAccessibilityService.isRunning();
+        String service = running ? "Connected" : settingEnabled ? "Enabled · connecting" : "Not enabled";
+        floatingStatus.setText("Accessibility service: " + service
+                + "\nOptional bubble: " + (ProfileStore.bubbleEnabled(this) ? "On" : "Off (default)")
+                + "    Global mode: " + EinkController.label(ProfileStore.globalMode(this))
+                + "\nPanel: QS tile tap or extra-button double press");
+        bubbleButton.setText(ProfileStore.bubbleEnabled(this) ? "Hide bubble" : "Show bubble");
     }
 
     private void setAnimation(int mode) {
@@ -290,7 +359,7 @@ public class MainActivity extends Activity {
     }
 
     private void switchToStock() {
-        new AlertDialog.Builder(this)
+        AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("Switch to stock ROM?")
                 .setMessage("Disables this GSI and reboots into stock. To come back, "
                         + "run on the PC:\n\nadb shell gsi_tool enable && adb reboot")
@@ -308,7 +377,15 @@ public class MainActivity extends Activity {
                                 + "sync; sleep 1; reboot");
                     }
                 }))
-                .show();
+                .create();
+        dialog.getWindow().setWindowAnimations(0);
+        dialog.setOnShowListener(d -> {
+            Button negative = dialog.getButton(AlertDialog.BUTTON_NEGATIVE);
+            Button positive = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+            if (negative != null) EinkUi.styleButton(negative, false, false);
+            if (positive != null) EinkUi.styleButton(positive, false, true);
+        });
+        dialog.show();
     }
 
     // ------------------------------------------------------------------ reading
@@ -330,8 +407,8 @@ public class MainActivity extends Activity {
         cmd.append("echo \"cold=$(cat $C 2>/dev/null)\";");
         cmd.append("echo \"warm=$(cat $W 2>/dev/null)\";");
         cmd.append("echo \"master=$(cat $C 2>/dev/null)\";");
-        cmd.append("echo \"s.blurs=$(settings get global disable_window_blurs)\";");
-        cmd.append("echo \"s.contrast=$(settings get secure accessibility_high_text_contrast_enabled)\";");
+        cmd.append("echo \"s.blurs=$(settings get global disable_window_blur)\";");
+        cmd.append("echo \"s.contrast=$(settings get secure high_text_contrast_enabled)\";");
         cmd.append("echo \"s.anim=$(settings get global window_animation_scale)\";");
         cmd.append("echo \"last=$(logcat -d -s hwcomposer | grep 'normal commit' "
                 + "| tail -1 | sed 's/.*normal commit/normal commit/')\"");
@@ -359,8 +436,10 @@ public class MainActivity extends Activity {
 
         String mode = val("vendor.xrz.global_refresh_mode").trim();
         for (Map.Entry<String, Button> e : modeButtons.entrySet()) {
-            e.getValue().setText(e.getKey().equals(mode)
+            boolean selected = e.getKey().equals(mode);
+            e.getValue().setText(selected
                     ? e.getValue().getTag() + " •" : String.valueOf(e.getValue().getTag()));
+            EinkUi.styleButton(e.getValue(), selected, false);
         }
 
         for (Object[] e : switches) {
@@ -376,6 +455,7 @@ public class MainActivity extends Activity {
                         || v.equals("1") || v.equals("1.0"));
             }
             sw.setChecked(checked);
+            sw.jumpDrawablesToCurrentState();
             syncing[0] = false;
         }
 
@@ -478,8 +558,9 @@ public class MainActivity extends Activity {
         l.setPadding(dp(14), dp(12), dp(14), dp(12));
 
         GradientDrawable bg = new GradientDrawable();
+        bg.setColor(EinkUi.WHITE);
         bg.setCornerRadius(dp(18));
-        bg.setStroke(Math.max(1, dp(1)), 0x33808080);
+        bg.setStroke(Math.max(1, dp(1)), EinkUi.BLACK);
         l.setBackground(bg);
 
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
@@ -492,7 +573,7 @@ public class MainActivity extends Activity {
             t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
             t.setAllCaps(true);
             t.setLetterSpacing(0.08f);
-            t.setTextColor(0xFF7A7A7A);
+            t.setTextColor(EinkUi.BLACK);
             t.setPadding(dp(2), 0, 0, dp(6));
             l.addView(t);
         }
@@ -502,7 +583,7 @@ public class MainActivity extends Activity {
     private TextView caption(LinearLayout parent, String s) {
         TextView t = text(s);
         t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        t.setTextColor(0xFF8A8A8A);
+        t.setTextColor(EinkUi.BLACK);
         t.setPadding(dp(2), dp(6), dp(2), dp(2));
         parent.addView(t);
         return t;
@@ -511,6 +592,7 @@ public class MainActivity extends Activity {
     private TextView text(String s) {
         TextView t = new TextView(this);
         t.setText(s);
+        t.setTextColor(EinkUi.BLACK);
         return t;
     }
 
@@ -539,11 +621,8 @@ public class MainActivity extends Activity {
     }
 
     private Button button(String label, Runnable action) {
-        Button b = new Button(this);
-        b.setText(label);
-        b.setAllCaps(false);
+        Button b = EinkUi.button(this, label, action);
         b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        b.setOnClickListener(v -> action.run());
         return b;
     }
 
@@ -552,6 +631,7 @@ public class MainActivity extends Activity {
         e.setHint(hint);
         e.setInputType(InputType.TYPE_CLASS_NUMBER);
         e.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        EinkUi.styleEditText(e);
         e.setOnFocusChangeListener((v, has) -> {
             if (has) editingFps = true;
         });
@@ -563,16 +643,17 @@ public class MainActivity extends Activity {
         Switch sw = new Switch(this);
         sw.setText(label);
         sw.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        sw.setPadding(dp(2), dp(8), 0, dp(8));
+        EinkUi.styleSwitch(sw);
         final boolean[] syncing = {false};
         switches.add(new Object[]{sw, cacheKey, syncing});
         sw.setOnCheckedChangeListener((btn, on) -> {
+            sw.jumpDrawablesToCurrentState();
             if (syncing[0]) return;
             String cmd;
             if (cacheKey.equals("s.blurs")) {
-                cmd = "settings put global disable_window_blurs " + (on ? 1 : 0);
+                cmd = "settings put global disable_window_blur " + (on ? 1 : 0);
             } else if (cacheKey.equals("s.contrast")) {
-                cmd = "settings put secure accessibility_high_text_contrast_enabled " + (on ? 1 : 0);
+                cmd = "settings put secure high_text_contrast_enabled " + (on ? 1 : 0);
             } else {
                 String v = on ? "0" : "1";
                 cmd = "settings put global window_animation_scale " + v
@@ -588,10 +669,11 @@ public class MainActivity extends Activity {
         Switch sw = new Switch(this);
         sw.setText(label);
         sw.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        sw.setPadding(dp(2), dp(8), 0, dp(8));
+        EinkUi.styleSwitch(sw);
         final boolean[] syncing = {false};
         switches.add(new Object[]{sw, key, syncing});
         sw.setOnCheckedChangeListener((b, on) -> {
+            sw.jumpDrawablesToCurrentState();
             if (syncing[0]) return;
             String v = on ? "1" : "0";
             String cmd = "setprop " + key + " " + v;
@@ -611,6 +693,7 @@ public class MainActivity extends Activity {
         caption.setPadding(dp(2), dp(10), dp(2), 0);
 
         SeekBar sb = new SeekBar(this);
+        EinkUi.styleSeekBar(sb);
         sb.setMax(FL.length - 1);
         sb.setTag(label);
         sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
@@ -658,6 +741,7 @@ public class MainActivity extends Activity {
         caption.setPadding(dp(2), dp(10), dp(2), 0);
 
         SeekBar sb = new SeekBar(this);
+        EinkUi.styleSeekBar(sb);
         sb.setMax(max);
         sb.setTag(label);
         sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {

@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_service_description">Hosts the floating E-ink Center, switches per-app refresh profiles, and remaps the extra hardware button. It does not read screen content.</string>
+</resources>

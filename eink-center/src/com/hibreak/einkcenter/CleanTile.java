@@ -20,10 +20,7 @@ public class CleanTile extends TileService {
     @Override
     public void onClick() {
         super.onClick();
-        new Thread(() -> {
-            // e-ink panels do a full GC refresh on wake
-            Root.run("input keyevent 26; sleep 1; input keyevent 26; "
-                    + "service call SurfaceFlinger 1008 i32 1");
-        }).start();
+        android.util.Log.i("EinkCenter", "QS refresh clicked");
+        EinkController.fullRefreshAsync(this);
     }
 }

@@ -39,12 +39,12 @@ public class LightTile extends TileService {
         int cold = getSharedPreferences("eink", MODE_PRIVATE).getInt(PREF_COLD, DEF_COLD);
         int warm = getSharedPreferences("eink", MODE_PRIVATE).getInt(PREF_WARM, DEF_WARM);
         if (on) {
-            Root.run("P=$(ls " + LM + "cold_light 2>/dev/null | head -1); "
+            RootShell.get().cmd("P=$(ls " + LM + "cold_light 2>/dev/null | head -1); "
                     + "[ -n \"$P\" ] && echo " + cold + " > \"$P\"; "
                     + "P=$(ls " + LM + "warm_light 2>/dev/null | head -1); "
                     + "[ -n \"$P\" ] && echo " + warm + " > \"$P\"");
         } else {
-            Root.run("P=$(ls " + LM + "cold_light 2>/dev/null | head -1); "
+            RootShell.get().cmd("P=$(ls " + LM + "cold_light 2>/dev/null | head -1); "
                     + "[ -n \"$P\" ] && echo 0 > \"$P\"; "
                     + "P=$(ls " + LM + "warm_light 2>/dev/null | head -1); "
                     + "[ -n \"$P\" ] && echo 0 > \"$P\"");

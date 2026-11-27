@@ -14,7 +14,7 @@
 # it restarts the adb server so the USB device is picked up immediately.
 param(
     [string]$Match  = '0e8d:201c',                 # MTK vendor:product of the HiBreak
-    [string]$Serial = '<DEVICE-SERIAL>',     # its USB serial
+    [string]$Serial = 'B531D1W2GFSA006000183',     # its USB serial
     [switch]$Share,
     [switch]$NoAdbRestart
 )

@@ -1,45 +1,58 @@
-# Status — 2026-11-24
+# Status — 2026-11-27
 
-## Measured on the device (TD A16 GSI, full panel, `format=0`, `ret=0`)
+## Visible 60 fps accepted
 
-| configuration | processImage | commit `dt` | commits/s | note |
-|---|---|---|---|---|
-| vendor, untouched | 37 ms | 34 ms | ~27 | RGBA→grey conversion + 4 MB copy |
-| `-Fastconv 1` (our converter) | 35 ms | 34 ms | ~28 | correct, safe; converter ~2.3 ms, copy dominates |
-| `-Skipcopy 1` | 3–4 ms | 16 ms | 63 | **black frames** — removes the converter's input |
-| `-Skipcopy 1 -CtSrc 1` | 3–4 ms | — | — | crashed the composer (mapper lock in gralloc) |
-| `-Skipconv 1` (RGBA to kernel) | 0.04 ms | 235 ms | ~4 | kernel RGB→grey is slower |
-| `-Fast 1 -Ownbuf 1` (own ION buffer) | 3–4 ms | 85 ms | ~12 | ION writes ~80 ms (uncached) |
+Production configuration:
 
-`fastconv` alone is the only configuration that is both faster than the vendor on CPU
-and visually correct. The interval stays ~34 ms because of the 4 MB staging copy.
+```powershell
+pwsh -File hwc-shim/deploy.ps1 `
+  -Fast 0 -Xproc 1 -XprocVendor 1 -HelperOnebit 0 -Mode -1 `
+  -Nofence 0 -EinkVsync 1 -Log 1 -LogEvery 60 -Watchdog 90
+```
 
-## Proven
+| test | physical vendor commits | rate | fallbacks |
+|---|---:|---:|---:|
+| Hyper 60 s final soak | 3593 | 59.88/s | 0 |
+| Post-recovery Hyper 10 s | 602 | 60.2/s | 0 |
+| Post-reboot Hyper 10 s | 598 | 59.8/s | 0 |
+| Final clean-boot Hyper 10 s | 600 | 60.0/s | 0 |
 
-- The vendor composer spends 31–80 ms (avg 33.5 ms) in a `memcpy` of the client target
-  into a staging buffer; `GraphicBuffer::lock` (50–115 µs), `sync_wait` (~30 µs) and
-  the 4.1 MB `memcmp` (24–40 µs) are not the cost.
-- Our NEON converter is correct: 0.35/255 mean difference vs the vendor's, max 29,
-  no pixel off by >32.
-- The driver accepts commits every 12.5–17.4 ms (`ret=0`) once the copy is out of the
-  way, so ~60 Hz per commit is possible.
-- `clean_a2=1` + `anti_flicker=1` + the stock `vendor.xrz.*` properties fix the
-  ghosting/stutter that made fast modes unusable; E-ink Center applies them at boot.
+The 60 s soak held `SUnreclaim` near 281 MB with stable composer/helper RSS and
+bounded fd/dma-buf counts. Helper recovery completed in 4 seconds without a
+composer restart. HD 256/Regal bypass the helper and retain the vendor pipeline.
+SELinux remains enforcing.
 
-## Rejected (measured, do not retry)
+## Architecture
 
-- `skipcopy` as a speed mode: black frames.
-- RGBA to the kernel (`skipconv`): 13–235 ms per commit.
-- In-place grey on the client target: 90 ms of uncached writes.
-- Private ION destination: 80 ms per 1 MB write, even from `ion_system_heap` with
-  `ION_FLAG_CACHED|CACHED_NEEDS_SYNC`.
-- `GraphicBufferMapper::importBuffer`+`lock` of the client target inside the composer:
-  SIGSEGV in `gralloc.rogue.so` (fault at 0x8) on the e-ink worker.
+- HWC sends the real RGBA client target to the helper (`GB01`).
+- GLES2/PowerVR converts it to packed gray.
+- The helper writes into the vendor's own gray commit dma-buf (`HWO1`).
+- The vendor worker performs waveform selection, physical commit, fences,
+  scan-out, input handling, and ghost cleanup.
 
-## Known caveats
+Four imported client targets are cached by dma-buf identity. The persisted profile
+sets `debug.sf.luma_sampling=0`, removing unnecessary RegionSampling passes.
+Average helper conversion is about 11–12 ms.
 
-- `deploy.ps1` sets knobs with `adb shell setprop` and ignores failures; on a flaky
-  wireless link the old values can persist and the next start runs a stale config.
-  Read them back after deploy.
-- The e-ink debugfs nodes are root-writable only; the app writes them at boot.
-- Vendor binaries are not redistributed here.
+## Invalid path
+
+Do **not** use `-Fast 1 -Xproc 1`. It commits the helper's separate buffer and can
+leave the physical panel frozen. Use `-XprocVendor 1`.
+
+## E-ink Center and sleep
+
+E-ink Center 0.3.5 adds per-app modes, extra-button actions, lock-wallpaper
+cycling, dual frontlight control, and an optional one-shot sleep wallpaper. The
+sleep frame appears before timeout or physical power-button sleep, is cancelled
+by new input, and is skipped for screen-bright wake locks. AOD remains off and the
+device enters normal deep doze.
+
+Touch/double-tap wake is unsupported by this kernel/driver; use the power button.
+
+## Persistence and rollback
+
+`hwc-shim/deploy.ps1` installs an idempotent boot re-apply script. E-ink Center
+launches it after DSU boot, restoring the bind mount, cached helper, watchdog,
+and saved profile. `deploy.ps1 -Revert` writes `persist.disabled`; the overlay then
+stays detached across reboots. No boot/kernel/vendor partition or DSU userdata is
+modified.

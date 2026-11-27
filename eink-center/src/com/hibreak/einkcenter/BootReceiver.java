@@ -15,12 +15,14 @@ import android.content.Intent;
  *
  * BOOT_COMPLETED only schedules the work: holding goAsync() across the retry
  * window exceeds the broadcast timeout and produces an ANR, so each attempt is
- * a separate alarm instead.
+ * a separate alarm instead. The same retries launch the optional HWC/helper
+ * boot persistence script when deploy.ps1 has installed it.
  */
 public class BootReceiver extends BroadcastReceiver {
 
     private static final String ACTION_TICK = "com.hibreak.einkcenter.TICK";
     private static final int[] DELAYS_MS = {6000, 12000, 25000, 45000};
+    private static final String HWC_PERSIST = "/data/local/tmp/hwc-shim-mt6765/persist.sh";
 
     @Override
     public void onReceive(Context context, Intent intent) {
@@ -56,7 +58,9 @@ public class BootReceiver extends BroadcastReceiver {
             final PendingResult pending = goAsync();
             new Thread(() -> {
                 try {
-                    Root.run("setprop persist.vendor.xrz.fps 120; "
+                    Root.run(EinkUiPreset.applyCommand() + "; "
+                            + EinkUiPreset.batteryFirstCommand() + "; "
+                            + "setprop persist.vendor.xrz.fps 120; "
                             + "setprop persist.vendor.xrz.fps_high 38; "
                             + "setprop persist.vendor.xrz.fps_low 30; "
                             // Auto full-refresh every 10 page turns: the daemon
@@ -81,31 +85,22 @@ public class BootReceiver extends BroadcastReceiver {
                             + "setprop vendor.xrz.anti_alias_enabled 1; "
                             + "setprop vendor.xrz.gray_256_dither 1; "
                             // Fewer full-screen refreshes and no rotation churn.
-                            + "settings put global window_animation_scale 0; "
-                            + "settings put global transition_animation_scale 0; "
-                            + "settings put global animator_duration_scale 0; "
                             + "settings put system accelerometer_rotation 0; "
-                            + "settings put global heads_up_notifications_enabled 0; "
-                            + "settings put global disable_window_blur 1; "
                             + "service call SurfaceFlinger 1008 i32 1; "
-                            // Keep the lock screen on the panel instead of
-                            // letting the composer blank it.  The AOD overlay
-                            // makes SystemUI request DOZE_SUSPEND, and the
-                            // debug prop bypasses the framework's
-                            // config_dozeAlwaysOnDisplayAvailable=false.
-                            + "setprop debug.doze.aod true; "
-                            + "settings put secure doze_always_on 1; "
-                            + "settings put secure doze_enabled 1; "
-                            + "cmd overlay enable --user 0 "
-                            + "me.phh.treble.overlay.misc.aod_systemui; "
-                            + "setprop persist.sys.overlay.aod 1; "
                             + "settings put global stay_on_while_plugged_in 0; "
+                            + "find /sys/fs/cgroup -mindepth 3 -maxdepth 3 -type d -name 'pid_*' -exec rmdir {} + 2>/dev/null; "
                             // Start the HBPC E-ink app's native daemon, if the
                             // patched copy is installed.  It accepts our app's
                             // uid and serves the /sys frontlight nodes.
                             + "killall a9_eink_server 2>/dev/null; "
                             + "nohup /data/local/tmp/a9_eink_server "
                             + ">/data/local/tmp/a9_eink_server.log 2>&1 &");
+                    // Reapply the runtime HWC/helper overlay after a DSU reboot.
+                    // The script is idempotent, verifies the vendor ABI/SELinux,
+                    // and honors persist.disabled left by deploy.ps1 -Revert.
+                    Root.run("if [ -x " + HWC_PERSIST + " ]; then "
+                            + "nohup sh " + HWC_PERSIST
+                            + " >/data/local/tmp/hwc-shim-mt6765/persist-boot.log 2>&1 </dev/null & fi");
                 } finally {
                     pending.finish();
                 }

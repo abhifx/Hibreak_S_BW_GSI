@@ -75,20 +75,36 @@ public final class LockWallpapers {
 
     /** Advance to the next image and set it as the lock-screen wallpaper. */
     public static void next(Context c) {
-        File[] files = images(c);
-        if (files == null || files.length == 0) return;
-        SharedPreferences p = c.getSharedPreferences("eink", Context.MODE_PRIVATE);
-        int idx = (p.getInt("wall_index", -1) + 1) % files.length;
+        Bitmap out = takeNext(c, "wall_index");
+        if (out == null) return;
         try {
-            Bitmap src = decode(files[idx]);
-            if (src == null) return;
-            Bitmap out = render(src);
-            src.recycle();
             WallpaperManager wm = WallpaperManager.getInstance(c);
             wm.setBitmap(out, null, true, WallpaperManager.FLAG_LOCK);
-            p.edit().putInt("wall_index", idx).apply();
         } catch (Throwable ignored) {
             // Write may fail while the screen is off; try again on the next lock.
+        } finally {
+            out.recycle();
+        }
+    }
+
+    /** Decode the next sleep image without changing the Android wallpaper. */
+    public static Bitmap nextSleep(Context c) {
+        return takeNext(c, "sleep_wall_index");
+    }
+
+    private static Bitmap takeNext(Context c, String indexKey) {
+        File[] files = images(c);
+        if (files == null || files.length == 0) return null;
+        SharedPreferences p = c.getSharedPreferences("eink", Context.MODE_PRIVATE);
+        int idx = (p.getInt(indexKey, -1) + 1) % files.length;
+        Bitmap src = decode(files[idx]);
+        if (src == null) return null;
+        try {
+            Bitmap out = render(src);
+            p.edit().putInt(indexKey, idx).apply();
+            return out;
+        } finally {
+            src.recycle();
         }
     }
 

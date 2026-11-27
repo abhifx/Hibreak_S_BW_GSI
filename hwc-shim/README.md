@@ -128,7 +128,11 @@ never misses a changed pixel.
 | **`fastconv`** | **0** | **1 = replace `xrz::EffectHandler::convertToGray` with the NEON converter** |
 | `verify` | 0 | 1 = also run the vendor's converter and log the difference (keeps its output) |
 | `conv_dst_pitch` | −1 | destination pitch in bytes for `fastconv` (−1 = stride/4) |
-| `skipcopy` | 0 | 1 = drop the vendor's 4 MB staging copy (**works with the stock e-ink props/clean_a2**) |
+| `skipcopy` | 0 | 1 = drop the vendor's 4 MB staging copy — **unsafe: commits black frames; do not use as a speed mode** |
+| `xproc` | 0 | 1 = use the out-of-process gray helper |
+| `xproc_vendor` | 0 | 1 = helper feeds vendor gray buffer; vendor performs physical commit (visible 60 fps) |
+| `xproc_damage` | 0 | 1 = opt-in partial GPU conversion when valid CT damage is available; current GSI exposes none, so keep 0 |
+| `helper_onebit` | 0 | 1 = force B/W helper output; 0 = 16-level gray (default, preserves Hyper gradients) |
 | `novsync` | 0 | 1 = bypass `mtk_waitVSync` pacing (12.5–17 ms per commit once the copy is gone) |
 | `fast_idle` | 1 | no damage → no commit at all |
 | `fast_diff` | 0 | 1 = pixel-diff the client target, commit only the changed bbox |
@@ -149,28 +153,161 @@ adb shell dumpsys SurfaceFlinger | grep -A8 hwcshim
 
 ---
 
-## Fast path (2026-11-24) — corrected status: ~28–30 fps ceiling
+## 2026-11-26 — exact vendor destination + empty-cgroup reclamation
 
-**Use `-Fastconv 1` only.** It replaces the vendor converter with a NEON one
-(2.3 ms, verified 0.35/255 against the vendor's) and is safe. The deploy also sets
-the stock `vendor.xrz.*` properties, and `apply.sh` writes
-`eink_debug/clean_a2` + `anti_flicker` — all of which were off on the GSI.
+- `hook_mtk_commit` no longer rewrites `cfg->fd`.
+- `hook_gb_lock` matches the exact vendor output `GraphicBuffer` when
+  `GraphicBuffer::lock(usage=0x30)` runs inside the active `processImage` job, then
+  resolves that object's `CommitBuffer+0x18` fd under `OverlayEngine+0x428`.
+  No round-robin destination guess and no `cfg->fd` rewrite.
+- A timed-out helper job quarantines that dma-buf identity for 8 seconds; the
+  vendor converter remains in charge for the quarantined destination.
+- The helper uses a persistent abstract-socket connection and cached output
+  EGLImages/textures/FBOs. Input/output GL resources are released on failure.
+- A real `ct_map` fallback leak was fixed: retained ION imports and their map fds
+  are now freed on cache eviction/error.
+- Empty per-PID cgroup2 directories are reaped by `helper-watchdog.sh`, E-ink
+  Center (boot/input/screen transitions), and provisioning. Removing 1,011 stale
+  cgroups dropped `SUnreclaim` by ~976 MB in the same boot; full cleanup later
+  reached ~280 MB with ~2.62 GB `MemAvailable`.
+- E-ink Center's `Root.run`, frontlight writes, and touch-node lookup now share
+  the persistent root shell rather than spawning new root processes.
+- Boot/provisioning reclaim empty cgroups and retain the current Home app. They
+  no longer automatically disable GMS/GSF/Vending or force-stop TrebleApp/Launcher3.
+- The exact vendor destination is resolved from the output `GraphicBuffer` during
+  `lock(usage=0x30)` for the active job, not guessed from rotating pool pointers.
+- `CtMap` cache slots are initialized with `ion_handle=-1`/`map_fd=-1` so an
+  unused slot cannot accidentally free handle/fd 0.
+- E-ink Center default navigation is one transparent 28 dp (48 px) non-touchable
+  gesture strip with an 8 dp handle. Static overlay ownership prevents duplicates
+  across accessibility reconnects; three reconnect cycles retained one window.
+  The legacy 64 dp three-button bar remains opt-in.
+- Full refresh restores the prior refresh mode after its one-shot GC16 request.
+- Final clean results: Fast 10 s **581 commits (58.1/s)**; Hyper 60 s **3523
+  commits (58.72/s)**; post-recovery Hyper 10 s **588 (58.8/s)**; post-wake Hyper
+  10 s **595 (59.5/s)**; final post-E-ink-Center Hyper 10 s **587 (58.7/s)**. All
+  had zero fallbacks, quarantines, and crashes. The 60 s soak kept `SUnreclaim`
+  ~343 MB, helper RSS 56,496 kB, and fd/dma-buf counts bounded. Prior
+  overlapping-run counts are discarded.
 
-Why not 60 fps from here:
+## Fast path (2026-11-25) — visible 60 fps via vendor-pipeline helper
 
-- the GSI's SurfaceFlinger hands the composer **4 MB of RGBA** per frame;
-- the vendor pipeline's 4 MB staging copy costs **31–80 ms (avg 33.5 ms)** and is
-  the **input** to the converter — `skipcopy=1` therefore commits black frames
-  (63 commits/s of black, which is what the earlier "60 fps" measurement was);
-- raw `mmap` of the client target is uncached (80 ms per 4 MB) and `ion_import`
-  is rejected (`ENOTTY`); only the vendor's own `GraphicBuffer::lock` mappings are
-  cached;
-- stock and the Pro reach 60 because their SurfaceFlinger pre-converts to
-  1-bit/16-level grey first (Pro repo patch 0013), so the composer copies 1 MB.
+**Visible 60 fps is achieved in both Fast and Hyper modes with `xproc_vendor=1`.**
+The latest candidate binds a source snapshot at worker-job start, waits its fence,
+matches the vendor's exact output `GraphicBuffer` during
+`GraphicBuffer::lock(usage=0x30)`, and sends that object's `CommitBuffer+0x18` fd to
+the helper. `hook_mtk_commit` keeps the vendor's original fd unchanged. A helper
+failure uses a same-frame snapshot fallback into that vendor buffer; timed-out
+destinations are quarantined, and sustained stalls trigger
+`helper-watchdog.sh` recovery. Final clean soak results are recorded above;
+older fd-redirection measurements are obsolete.
 
-So the correct ceiling is **~28–30 fps** with the vendor's own waveform and image.
-60 fps requires a patched/built **system image** with the SF e-ink render pass,
-not a userspace HWC shim. Do not use `skipcopy` as a speed mode.
+The GPU helper writes packed gray directly into the vendor's own gray commit fd(s);
+the vendor worker keeps its normal `processImage`/`triggerEinkCommit`/`mtk_commit`
+path, so the physical panel, touch input, grayscale, and ghost cleaning continue to
+work.
+
+Measured Fast: 1886 physical vendor commits/30 s (62.9/s), 639/10 s (63.9/s).
+Measured Hyper with 16-level gray: 633/10 s (63.3/s). Choreographer 120–124/s,
+zero fallbacks. SELinux remains enforcing.
+
+The follow-up build clones the `GB01` native handle under the snapshot lock for
+each vendor conversion, fixing a use-after-free when the next client target
+arrived. It measured 610/10 s (61/s) and 1851/30 s (61.7/s) in Hyper with zero
+fallbacks and no composer restart. The profiling-only `memcmp` hook was later
+removed after a stress crash; the current build measured 602/10 s and 1794/30 s
+(~59.8/s) with no crash and a stable composer PID.
+
+The helper is now restricted to Fast/Extreme/Hyper/A2. HD 256 and Regal use the
+full vendor conversion/copy path because skipping the staging copy can crash
+the vendor in those quality modes. HD 256 passed 20 repeated shade cycles;
+Hyper measured 602/10 s with zero fallbacks.
+
+Helper failures now clear the ready flag immediately, so the vendor staging copy
+resumes instead of feeding stale data to the fallback converter. A five-second
+watchdog restarts a dead helper. A controlled outage test kept the composer alive
+and restored the helper automatically; Hyper then measured 593/10 s with one
+safe fallback.
+
+The vendor can also call a 4 MB `memcmp` with the sentinel pointer `-1`. A guarded
+hook rejects only clearly invalid large-buffer pointers, preventing the
+`processImage` SIGSEGV. A 60 s Hyper soak measured 3420 commits (57/s), zero
+fallbacks, unchanged composer PID, and no crash; HD 256 passed 20 shade cycles.
+
+### Working deployment
+
+`deploy.ps1` now defaults to this known-good profile. Pass
+`-Xproc 0 -XprocVendor 0` explicitly for a vendor-only deployment.
+
+```powershell
+pwsh -File build/hwc-shim-mt6765/build-all.ps1
+pwsh -File build/hwc-shim-mt6765/deploy.ps1 `
+  -Fast 0 -Xproc 1 -XprocVendor 1 -HelperOnebit 0 -Mode -1 `
+  -Nofence 0 -EinkVsync 1 -Log 1 -LogEvery 60 -Watchdog 90
+adb push tools/measure-xproc-vendor.sh /data/local/tmp/measure-xproc-vendor.sh
+adb shell chmod 755 /data/local/tmp/measure-xproc-vendor.sh
+adb shell sh /data/local/tmp/measure-xproc-vendor.sh 10 178 1
+
+# Hyper with 16-level gray (third argument forces the mode):
+adb shell sh /data/local/tmp/measure-xproc-vendor.sh 60 183 1
+```
+
+The measurement script serializes runs and temporarily removes only E-ink
+Center's accessibility component so its per-app mode controller cannot override
+the requested mode. It restores the component and all properties/settings on
+exit, and fails if benchmark frame logs or physical commit logs are missing.
+
+### Damage-aware helper status
+
+Protocol v2 can carry a job-bound damage rectangle. The helper keeps a packed-gray
+accumulator, updates up to four scissored GPU bands, and always copies the complete
+accumulator into the exact rotating vendor buffer. Standalone tests are byte-exact
+against a full-frame reference for both 16-level and 1-bit output.
+
+The current GSI passes zero client-target damage rects and only full-screen layer
+damage, so there is no safe partial rectangle to use. `xproc_damage` therefore
+defaults to 0 and the production path remains full-frame. The opt-in code is kept
+for a future damage-capable SurfaceFlinger/HWC path.
+
+Perfetto tracing then identified two safe full-frame optimizations:
+`debug.sf.luma_sampling=0` removes unnecessary RegionSampling compositions, and a
+four-entry input cache eliminates repeated gralloc imports. The final 60 s Hyper
+soak reached 3593 commits (59.88/s) with zero fallbacks and flat memory/fd/RSS;
+post-reboot Hyper measured 598/10 s (59.8/s).
+
+The helper uses an abstract socket, raw `GB01` input transfer, GLES2 packed-gray
+conversion, and a raw vendor-output fd (`HWO1` + `SCM_RIGHTS`). Four imported
+client targets are cached by dma-buf identity, eliminating repeated gralloc
+import/free work. The persisted profile also sets `debug.sf.luma_sampling=0`
+because brightness is manual; this removes SurfaceFlinger's extra RegionSampling
+compositions and reduces buffer pressure. Together these changes reduced helper
+conversion to ~11.1 ms and warm Settings 90th-percentile frames to ~30 ms.
+
+### Boot persistence
+
+`deploy.ps1` writes `persist.env`, `persist.layout`, and `persist.watchdog`, then
+installs `device/persist.sh`. E-ink Center's existing boot receiver launches the
+script on its retry ticks. The script is idempotent per boot, verifies SELinux
+and the approved vendor ABI, restores the saved properties, starts the helper and
+watchdog, reapplies the bind mount, and verifies the display stack before writing
+`persist.boot`.
+
+A normal redeploy re-enables persistence. `deploy.ps1 -Revert` creates
+`persist.disabled`, detaches the overlay, and leaves it disabled across reboots.
+To disable manually without detaching immediately:
+
+```sh
+adb shell touch /data/local/tmp/hwc-shim-mt6765/persist.disabled
+```
+
+The next reboot then stays on the vendor composer. A normal deploy removes the
+marker and re-enables boot re-application.
+
+**Do not use the older direct mode** `-Fast 1 -Xproc 1`: it commits the helper's
+separately allocated buffer and produces fast software calls, but the physical
+panel stays frozen. Also do not use `skipcopy` as a speed mode; by itself it
+commits black frames. The vendor-only `fastconv=1` mode remains the safe
+~28–30 fps fallback.
 
 
 The rest of this section is the earlier reasoning; it is kept because the
@@ -400,9 +537,10 @@ not take the client target and the vendor path is the only one.
 
 ## Risks
 
-- A broken shim can blank the display or crash the composer. `adb reboot`
-  restores everything: nothing is written to a persistent partition, the swap is
-  a bind mount and `/system/xbin` is tmpfs.
+- A broken shim can blank the display or crash the composer. With persistence
+  enabled, reboot reapplies the same verified bind mount. To return to the vendor
+  composer across reboots, run `deploy.ps1 -Revert` (it writes `persist.disabled`)
+  or create that marker manually. No boot/kernel/vendor partition is modified.
 - The vendor may ignore a shortened rectangle for some modes (GC16 / clean), in
   which case only the fast modes gain. That is a `mode` knob in this shim, so it
   is measurable.

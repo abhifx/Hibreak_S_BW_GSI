@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="me.phh.superuser"
+    android:versionCode="2"
+    android:versionName="probe">
+    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="34" />
+    <queries>
+        <package android:name="com.hibreak.einkcenter" />
+    </queries>
+    <application android:label="su policy store" android:allowBackup="false">
+        <receiver android:name="com.koushikdutta.superuser.SuReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="com.koushikdutta.superuser.SU_REQUEST" />
+            </intent-filter>
+        </receiver>
+        <activity android:name="com.koushikdutta.superuser.RequestActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.NoDisplay" />
+    </application>
+</manifest>

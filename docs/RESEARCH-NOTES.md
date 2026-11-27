@@ -1644,6 +1644,11 @@ Reaching 60 fps therefore needs the SF-side e-ink render pass — a source build
 not a userspace HWC shim. Everything else in this log (converter, pacing,
 properties, kernel knobs) is correct and useful, but it cannot remove that copy.
 
+> **Correction 2026-11-24 16:10:** the “composer moves 1 MB” claim above is not
+> supported by the published Pro patches. Patch `0013` keeps the client target
+> RGBA_8888; it pre-quantizes pixel values but does not compact the buffer. See
+> `SF-COMPATIBILITY-AUDIT.md` for the source/binary proof and rebased patch.
+
 ### 2026-11-24 08:45 — the missing e-ink init, fixed persistently
 
 The single biggest quality fix was not the shim: the GSI never initialises the

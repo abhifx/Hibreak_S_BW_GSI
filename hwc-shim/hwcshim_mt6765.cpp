@@ -74,6 +74,7 @@
 //
 // Build: see build.ps1. Deploy: see deploy.sh. Revert: reboot.
 
+#include <android/hardware_buffer.h>
 #include <android/log.h>
 #include <dlfcn.h>
 #include <elf.h>
@@ -83,13 +84,17 @@
 #include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/system_properties.h>
+#include <sys/time.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -174,6 +179,39 @@ struct hwc2_device_t {
 typedef uint64_t hwc2_display_t;
 typedef uint64_t hwc2_layer_t;
 struct native_handle_t { int version; int numFds; int numInts; int data[0]; };
+// The NDK does not expose libcutils. These handles are plain malloc-backed
+// metadata in AOSP, so clone/free them locally instead of adding a VNDK-only
+// link dependency to the shim.
+static native_handle_t* native_handle_clone(const native_handle_t* handle) {
+    if (!handle || handle->numFds <= 0 || handle->numFds > 128 ||
+        handle->numInts < 0 || handle->numInts > 4096) return nullptr;
+    const size_t bytes = sizeof(native_handle_t) +
+                         (size_t)(handle->numFds + handle->numInts) * sizeof(int);
+    native_handle_t* copy = static_cast<native_handle_t*>(malloc(bytes));
+    if (!copy) return nullptr;
+    memcpy(copy, handle, bytes);
+    for (int i = 0; i < handle->numFds; ++i) {
+        copy->data[i] = dup(handle->data[i]);
+        if (copy->data[i] < 0) {
+            for (int j = 0; j < i; ++j) close(copy->data[j]);
+            free(copy);
+            return nullptr;
+        }
+    }
+    return copy;
+}
+static void native_handle_delete(native_handle_t* handle) {
+    if (!handle) return;
+    for (int i = 0; i < handle->numFds; ++i) close(handle->data[i]);
+    free(handle);
+}
+
+// The vendor worker may outlive g_snap. A handle cloned while g_lock is held
+// keeps the GB01 metadata and its fd references valid for the whole conversion.
+struct NativeHandleLease {
+    native_handle_t* handle = nullptr;
+    ~NativeHandleLease() { native_handle_delete(handle); }
+};
 typedef const native_handle_t* buffer_handle_t;
 struct hwc_rect_t { int32_t left, top, right, bottom; };
 struct hwc_frect_t { float left, top, right, bottom; };
@@ -242,13 +280,12 @@ static int64_t (*real_convert_layer_gray)(void*, void*, void*);
 
 struct CallStat { uint64_t n, sum_us, max_us; };
 static CallStat g_st_pi, g_st_clg, g_st_gray, g_st_conv;
-static CallStat g_st_memcmp, g_st_sync, g_st_gblock, g_st_memcpy;
+static CallStat g_st_sync, g_st_gblock, g_st_memcpy;
 static uint64_t g_skipcopy_hits;
 
-static int (*real_memcmp)(const void*, const void*, size_t);
 static int (*real_sync_wait)(int, int);
+static int (*real_memcmp)(const void*, const void*, size_t);
 static int (*real_gb_lock)(void*, uint32_t, void**, int32_t*, int32_t*);
-static int (*real_gb_unlock)(void*);
 static void* (*real_memcpy)(void*, const void*, size_t);
 
 // Client target, as handed over by SurfaceFlinger. On this panel the client target
@@ -321,11 +358,56 @@ struct CtSnap {
     int stride;    // pixels
     int vstride;
     int format;    // HAL pixel format as reported by gralloc_extra
+    uint64_t usage; // gralloc usage (query 16 when available)
     bool valid;
+    native_handle_t* handle = nullptr; // cloned metadata/fds for GB01 transfer
 };
-static CtSnap g_snap = { -1, -1, 0, 0, 0, 0, 0, false };
+static CtSnap g_snap = { -1, -1, 0, 0, 0, 0, 0, 0, false };
 static int g_snap_seq;                // incremented on every new client target
 static int g_consumed_seq;            // last client target presentDisplay acted on
+
+// The vendor worker is asynchronous, so "the latest client target" is not
+// necessarily the one belonging to the CommitInfo currently being converted.
+// Keep a small history keyed by dma-buf identity; the worker binds the exact
+// snapshot named by OverlayPortParam+0x78 before it calls processImage.
+struct SnapHist {
+    CtSnap snap;
+    uint64_t seq;
+    uint64_t dev;
+    uint64_t ino;
+    bool valid;
+};
+static SnapHist g_snap_hist[8];
+
+// Job-local binding for the worker thread. Everything here is owned by this
+// thread for the duration of one processImage/convertLayerToGray call.
+struct SnapJob {
+    bool active;
+    bool matched;
+    bool copy_skipped;
+    bool helper_done;
+    bool helper_ambiguous;
+    bool fence_waited;
+    void* self;
+    void* param;
+    void* ci;
+    int dst_fd;
+    uint64_t src_dev;
+    uint64_t src_ino;
+    uint64_t dst_dev;
+    uint64_t dst_ino;
+    CtSnap snap;
+    uint64_t seq;
+    int damage_l = 0;
+    int damage_t = 0;
+    int damage_r = -1;
+    int damage_b = -1;
+    bool damage_valid = false;
+};
+static __thread SnapJob t_job = {
+    false, false, false, false, false, false, nullptr, nullptr, nullptr, -1, 0, 0, 0, 0,
+    { -1, -1, 0, 0, 0, 0, 0, 0, false }, 0,
+};
 
 static int g_fast;                    // 1 = commit from presentDisplay (own the commit)
 static int g_fast_idle;               // 1 = no damage -> no commit at all
@@ -344,9 +426,56 @@ static int g_dither1 = 1;             // 1 = dither to black/white in the 1-bit 
 static int g_verify;                  // 1 = compare our converter with the vendor's (keeps vendor output)
 static int g_conv_dst_pitch = -1;     // destination pitch in bytes (-1 = stride/4)
 static int g_skipcopy;                // 1 = drop the vendor's redundant 4 MB frame copy
+static int g_damagecopy;              // 1 = copy only CT-damaged pixels into the staging buffer
+static int g_xproc;                   // 1 = use the out-of-process cached gralloc gray helper
+static int g_xproc_vendor;            // 1 = helper feeds conversion, vendor performs commit
+static int g_xproc_damage;            // 1 = convert only valid CT damage when safe
+static int g_xproc_ready;             // atomic: helper path has succeeded at least once
+static int g_helper_onebit;           // 1 = force B/W helper output; 0 = 16-level gray
+static uint64_t g_damagecopy_hits, g_damagecopy_bytes, g_damagecopy_full_bytes;
+static uint64_t g_xproc_partial, g_xproc_full, g_xproc_partial_pixels;
+static CallStat g_st_xproc;
+static uint64_t g_xproc_fails;
+static int g_xproc_consec_fails;
+static int g_xproc_attempts;
+static uint64_t g_xproc_last_success_ns;
+static uint64_t g_xproc_retry_after_ns;
+static uint64_t g_helper_recovery_last_ns;
+static bool g_helper_recovery_set;
+struct DestQuarantine {
+    uint64_t dev;
+    uint64_t ino;
+    uint64_t until_ns;
+};
+static DestQuarantine g_dest_quarantine[4];
+static bool g_drop_next_commit;
+static int g_xproc_sock = -1;
+static int g_xproc_listen = -1;
+static pthread_mutex_t g_xproc_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_vendor_commit_fds[4];
+static int g_vendor_commit_fd_count;
+static int g_vendor_commit_fd_next;
+static constexpr uint32_t kRawOutputMagic = 0x314f5748; // 'HWO1'
+struct GrayRequest {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t width;
+    uint32_t height;
+    uint32_t onebit;
+    uint32_t reserved;
+    uint32_t left;
+    uint32_t top;
+    uint32_t right;
+    uint32_t bottom;
+};
+static_assert(sizeof(GrayRequest) == 40, "GrayRequest wire size changed");
+static constexpr uint32_t kGrayMagic = 0x31475748;       // 'HWG1' little-endian
+static constexpr uint32_t kGrayErrorMagic = 0x31455748;  // 'HWE1' little-endian
+static constexpr uint32_t kGbMagic = 0x47423031;         // AArch64 'GB01' multi-character literal
 static int g_ctsrc;                   // 1 = convert from the client target, not the staging buffer
 static int g_ownbuf;                  // 1 = fast path commits our own ION gray buffer
 static int g_ctprobe;                 // 1 = time the mapper against the raw mmap (read-only)
+static int g_vendor_fd_probe;         // 1 = one-time raw mmap/read probe of vendor commit fds
 static int g_ob_heap = -1;            // heap mask for libion (-1 = 0xffffffff)
 static int g_ob_flags = -1;           // ION flags (-1 = try CACHED then 0)
 static uint64_t g_last_wait_us, g_last_sync_us;
@@ -356,6 +485,7 @@ static int (*p_ion_heap_cnt)(int, int*);
 static int (*p_ion_get_heaps)(int, int, void*);
 static int (*p_ion_import)(int, int*);
 static int (*p_ion_map)(int, int, size_t, int, int, off_t, unsigned char**, int*);
+static int (*p_ion_free)(int, int);
 static int g_ion_fd = -1;
 
 // AOSP libion: struct ion_heap_data. Used to find ion_system_heap's id so the
@@ -403,9 +533,10 @@ static void load_ion(void) {
     *(void**)&p_ion_get_heaps = dlsym(h, "ion_query_get_heaps");
     *(void**)&p_ion_import = dlsym(h, "ion_import");
     *(void**)&p_ion_map = dlsym(h, "ion_map");
-    LOGI("ion: open=%p alloc_fd=%p import=%p map=%p heaps=%p/%p",
+    *(void**)&p_ion_free = dlsym(h, "ion_free");
+    LOGI("ion: open=%p alloc_fd=%p import=%p map=%p free=%p heaps=%p/%p",
          (void*)p_ion_open, (void*)p_ion_alloc_fd, (void*)p_ion_import,
-         (void*)p_ion_map, (void*)p_ion_heap_cnt, (void*)p_ion_get_heaps);
+         (void*)p_ion_map, (void*)p_ion_free, (void*)p_ion_heap_cnt, (void*)p_ion_get_heaps);
 }
 
 static bool ob_alloc_one(size_t len, int* out_fd) {
@@ -489,13 +620,29 @@ static uint64_t g_last_fast_ns, g_last_vend_ns;
 static uint32_t g_last_vendor_dither = 0xffffffff;
 static uint64_t g_fast_commits, g_fast_skips, g_fast_fails;
 static uint64_t g_fast_us_sum, g_fast_us_max;
+static uint64_t g_fast_dt_sum, g_fast_dt_max, g_last_fast_commit_ns;
 
 // mapped client target + shadow copy for the pixel diff. The client target fd
 // rotates between 2-3 buffers and mmap/munmap of 4 MB costs tens of ms on this
 // SoC, so keep a small ring of mappings instead of remapping every frame.
-struct CtMap { int fd; uint8_t* map; size_t len; };
-static CtMap g_ctmaps[4];
+struct CtMap {
+    int fd;
+    uint8_t* map;
+    size_t len;
+    uint64_t dev;
+    uint64_t ino;
+    int ion_handle;  // owned by libion; must be freed before replacing/unmapping
+    int map_fd;      // libion returns an independently allocated dma-buf fd
+    int users;       // active ct_map leases; eviction skips these slots
+};
+static CtMap g_ctmaps[4] = {
+    { -1, nullptr, 0, 0, 0, -1, -1, 0 },
+    { -1, nullptr, 0, 0, 0, -1, -1, 0 },
+    { -1, nullptr, 0, 0, 0, -1, -1, 0 },
+    { -1, nullptr, 0, 0, 0, -1, -1, 0 },
+};
 static int g_ctmap_next;
+static pthread_mutex_t g_ctmap_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t* g_shadow;
 static size_t   g_shadow_len;
 
@@ -513,6 +660,7 @@ extern "C" __attribute__((visibility("default"))) hw_module_t HMI;   // defined 
 static int g_log = 1;
 static int g_rect = 0;         // 0 observe, 1 rewrite
 static int g_mode = -1;        // forced e-ink mode, -1 = vendor
+static int g_global_mode = -1; // vendor.xrz.global_refresh_mode (E-ink Center)
 static int g_src = 1;          // 1 client target, 2 layer union
 static int g_xform = 0;        // see header
 static int g_min_pct = 1;
@@ -568,6 +716,7 @@ static void read_knobs() {
     g_log = prop_int("vendor.debug.hwc.shim.log", 1);
     g_rect = prop_int("vendor.debug.hwc.shim.rect", 0);
     g_mode = prop_int("vendor.debug.hwc.shim.mode", -1);
+    g_global_mode = prop_int("vendor.xrz.global_refresh_mode", -1);
     g_src = prop_int("vendor.debug.hwc.shim.src", 1);
     g_xform = prop_int("vendor.debug.hwc.shim.xform", 0);
     g_min_pct = prop_int("vendor.debug.hwc.shim.min_pct", 1);
@@ -598,11 +747,17 @@ static void read_knobs() {
     g_verify = prop_int("vendor.debug.hwc.shim.verify", 0);
     g_conv_dst_pitch = prop_int("vendor.debug.hwc.shim.conv_dst_pitch", -1);
     g_skipcopy = prop_int("vendor.debug.hwc.shim.skipcopy", 0);
+    g_damagecopy = prop_int("vendor.debug.hwc.shim.damagecopy", 0);
+    g_xproc = prop_int("vendor.debug.hwc.shim.xproc", 0);
+    g_xproc_vendor = prop_int("vendor.debug.hwc.shim.xproc_vendor", 0);
+    g_xproc_damage = prop_int("vendor.debug.hwc.shim.xproc_damage", 1);
+    g_helper_onebit = prop_int("vendor.debug.hwc.shim.helper_onebit", 0);
     g_ctsrc = prop_int("vendor.debug.hwc.shim.ctsrc", 0);
     g_ownbuf = prop_int("vendor.debug.hwc.shim.ownbuf", 0);
     g_ob_heap = prop_int("vendor.debug.hwc.shim.ob_heap", -1);
     g_ob_flags = prop_int("vendor.debug.hwc.shim.ob_flags", -1);
     g_ctprobe = prop_int("vendor.debug.hwc.shim.ctprobe", 0);
+    g_vendor_fd_probe = prop_int("vendor.debug.hwc.shim.vendor_fd_probe", 0);
     if (g_log_every < 1) g_log_every = 1;
 }
 
@@ -658,10 +813,118 @@ static Rect xform_rect(const Rect& in) {
 
 // ---------------------------------------------------------------- fast path
 
-// Adopt the client target SF just handed over: dup the dma-buf and its acquire
-// fence so both stay valid after SF (and the vendor) release their copies.
-static void snap_take(buffer_handle_t h, int fence) {
+static void ct_snap_clear(CtSnap* s) {
+    s->fd = -1;
+    s->fence = -1;
+    s->w = s->h = s->stride = s->vstride = s->format = 0;
+    s->usage = 0;
+    s->valid = false;
+    s->handle = nullptr;
+}
+
+static void ct_snap_release(CtSnap* s) {
+    if (!s) return;
+    if (s->fd >= 0) close(s->fd);
+    if (s->fence >= 0) close(s->fence);
+    if (s->handle) native_handle_delete(s->handle);
+    ct_snap_clear(s);
+}
+
+struct SnapLease {
+    CtSnap snap;
+    SnapLease() { ct_snap_clear(&snap); }
+    ~SnapLease() { ct_snap_release(&snap); }
+};
+
+// Caller holds g_lock. The duplicate owns its fd, fence and native handle.
+static bool ct_snap_clone_locked(const CtSnap& src, CtSnap* out) {
+    ct_snap_clear(out);
+    if (!src.valid || src.fd < 0) return false;
+    int fd = dup(src.fd);
+    if (fd < 0) return false;
+    int fence = src.fence >= 0 ? dup(src.fence) : -1;
+    if (src.fence >= 0 && fence < 0) {
+        close(fd);
+        return false;
+    }
+    native_handle_t* handle = src.handle ? native_handle_clone(src.handle) : nullptr;
+    if (src.handle && !handle) {
+        close(fd);
+        if (fence >= 0) close(fence);
+        return false;
+    }
+    *out = CtSnap{ fd, fence, src.w, src.h, src.stride, src.vstride, src.format,
+                   src.usage, true, handle };
+    return true;
+}
+
+static bool fd_identity(int fd, uint64_t* dev, uint64_t* ino) {
+    if (fd < 0 || !dev || !ino) return false;
+    struct stat st = {};
+    if (fstat(fd, &st) != 0) return false;
+    // dma-buf fds are anonymous inodes. A zero inode cannot identify a buffer.
+    if (st.st_ino == 0) return false;
+    *dev = (uint64_t)st.st_dev;
+    *ino = (uint64_t)st.st_ino;
+    return true;
+}
+
+// Caller holds g_lock. Keep one entry per dma-buf identity; SurfaceFlinger
+// rotates 2-3 client targets, so this is a small, bounded history.
+static void snap_hist_push_locked(const CtSnap& s, uint64_t seq, uint64_t dev,
+                                  uint64_t ino) {
+    if (!s.valid || ino == 0) return;
+    int slot = -1;
+    for (int i = 0; i < 8; ++i) {
+        if (g_snap_hist[i].valid && g_snap_hist[i].dev == dev &&
+            g_snap_hist[i].ino == ino) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < 8; ++i) {
+            if (!g_snap_hist[i].valid) { slot = i; break; }
+        }
+    }
+    if (slot < 0) {
+        slot = 0;
+        for (int i = 1; i < 8; ++i) {
+            if (g_snap_hist[i].seq < g_snap_hist[slot].seq) slot = i;
+        }
+    }
+    CtSnap clone;
+    if (!ct_snap_clone_locked(s, &clone)) return;
+    if (g_snap_hist[slot].valid) ct_snap_release(&g_snap_hist[slot].snap);
+    g_snap_hist[slot] = SnapHist{ clone, seq, dev, ino, true };
+}
+
+// Caller holds g_lock.
+static bool snap_hist_clone_by_fd_locked(int fd, CtSnap* out, uint64_t* seq) {
+    uint64_t dev = 0, ino = 0;
+    if (!fd_identity(fd, &dev, &ino)) return false;
+    int best = -1;
+    for (int i = 0; i < 8; ++i) {
+        if (!g_snap_hist[i].valid || g_snap_hist[i].dev != dev ||
+            g_snap_hist[i].ino != ino) continue;
+        if (best < 0 || g_snap_hist[i].seq > g_snap_hist[best].seq) best = i;
+    }
+    if (best < 0) return false;
+    if (!ct_snap_clone_locked(g_snap_hist[best].snap, out)) return false;
+    if (seq) *seq = g_snap_hist[best].seq;
+    return true;
+}
+
+// Clone the client target and its acquire fence before the vendor HWC consumes
+// the fence. The candidate is not visible to the worker until setClientTarget
+// returns success.
+static bool snap_build(buffer_handle_t h, int fence, CtSnap* out,
+                       uint64_t* snap_dev, uint64_t* snap_ino) {
+    ct_snap_clear(out);
+    *snap_dev = 0;
+    *snap_ino = 0;
     int fd = -1, fdup = -1, w = 0, hh = 0, stride = 0, vstride = 0, fmt = 0;
+    uint64_t usage = 0;
     if (h) {
         if (real_gralloc_extra_query) {
             int32_t v = 0;
@@ -671,31 +934,50 @@ static void snap_take(buffer_handle_t h, int fence) {
             v = 0; if (real_gralloc_extra_query(h, 12, &v) == 0) stride = v;
             v = 0; if (real_gralloc_extra_query(h, 13, &v) == 0) vstride = v;
             v = 0; if (real_gralloc_extra_query(h, 15, &v) == 0) fmt = v;
+            int32_t uv = 0; if (real_gralloc_extra_query(h, 16, &uv) == 0) usage = (uint32_t)uv;
         }
         if (fd < 0 && h->numFds > 0) fd = h->data[0];
     }
     if (fd >= 0) fd = dup(fd);
+    if (fd >= 0) fd_identity(fd, snap_dev, snap_ino);
     if (fd >= 0) fdup = (fence >= 0) ? dup(fence) : -1;
-    if (fd < 0 || w <= 0 || hh <= 0) {
+    native_handle_t* cloned = h ? native_handle_clone(h) : nullptr;
+    if (fd < 0 || w <= 0 || hh <= 0 || (fence >= 0 && fdup < 0) ||
+        (h && !cloned)) {
         if (fd >= 0) close(fd);
         if (fdup >= 0) close(fdup);
-        pthread_mutex_lock(&g_lock);
-        CtSnap old = g_snap;
-        g_snap = CtSnap{ -1, -1, 0, 0, 0, 0, 0, false };
-        pthread_mutex_unlock(&g_lock);
-        if (old.fd >= 0) close(old.fd);
-        if (old.fence >= 0) close(old.fence);
-        return;
+        if (cloned) native_handle_delete(cloned);
+        return false;
     }
     if (stride <= 0) stride = w;
     if (vstride <= 0) vstride = hh;
+    *out = CtSnap{ fd, fdup, w, hh, stride, vstride, fmt, usage, true, cloned };
+    return true;
+}
+
+// Publish a candidate only after the real setClientTarget accepted it. The
+// candidate's ownership transfers to g_snap (or is released on failure).
+static void snap_publish(CtSnap* candidate, bool valid, uint64_t dev, uint64_t ino) {
+    CtSnap old;
     pthread_mutex_lock(&g_lock);
-    CtSnap old = g_snap;
-    g_snap = CtSnap{ fd, fdup, w, hh, stride, vstride, fmt, true };
-    g_snap_seq++;
+    old = g_snap;
+    if (valid) {
+        g_snap = *candidate;
+        ct_snap_clear(candidate);
+        g_snap_seq++;
+        if (g_xproc || g_xproc_vendor)
+            snap_hist_push_locked(g_snap, (uint64_t)g_snap_seq, dev, ino);
+    } else {
+        g_snap = CtSnap{ -1, -1, 0, 0, 0, 0, 0, 0, false };
+        for (int i = 0; i < 8; ++i) {
+            if (!g_snap_hist[i].valid) continue;
+            ct_snap_release(&g_snap_hist[i].snap);
+            g_snap_hist[i].valid = false;
+        }
+    }
     pthread_mutex_unlock(&g_lock);
-    if (old.fd >= 0) close(old.fd);
-    if (old.fence >= 0) close(old.fence);
+    ct_snap_release(&old);
+    if (!valid) ct_snap_release(candidate);
 }
 
 // A sync fence becomes readable when signalled, so poll() is the whole wait.
@@ -705,15 +987,45 @@ static bool wait_fence(int fd, int timeout_ms) {
     uint64_t t0 = now_ns();
     int r = poll(&p, 1, timeout_ms);
     g_last_wait_us = (now_ns() - t0) / 1000;
-    return r > 0;
+    return r > 0 && (p.revents & POLLIN) != 0;
 }
 
+static void ct_map_evict(int i) {
+    if (i < 0 || i >= 4) return;
+    CtMap& m = g_ctmaps[i];
+    if (m.users != 0) return;  // caller selects an unreferenced slot
+    if (m.map) { munmap(m.map, m.len); m.map = nullptr; }
+    if (m.ion_handle >= 0 && g_ion_fd >= 0 && p_ion_free) {
+        p_ion_free(g_ion_fd, m.ion_handle);
+    }
+    if (m.map_fd >= 0) { close(m.map_fd); }
+    m.fd = -1;
+    m.dev = m.ino = 0;
+    m.len = 0;
+    m.ion_handle = m.map_fd = -1;
+}
+
+static bool ct_map_locked(const CtSnap& s, bool write, uint8_t** base, size_t* len);
+
 static bool ct_map(const CtSnap& s, bool write, uint8_t** base, size_t* len) {
+    pthread_mutex_lock(&g_ctmap_lock);
+    const bool result = ct_map_locked(s, write, base, len);
+    pthread_mutex_unlock(&g_ctmap_lock);
+    return result;
+}
+
+static bool ct_map_locked(const CtSnap& s, bool write, uint8_t** base, size_t* len) {
     load_ion();
     size_t need = (size_t)s.stride * 4 * (size_t)(s.vstride > s.h ? s.vstride : s.h);
     if (need == 0) return false;
+    uint64_t need_dev = 0, need_ino = 0;
+    const bool have_identity = fd_identity(s.fd, &need_dev, &need_ino);
     for (int i = 0; i < 4; i++) {
-        if (g_ctmaps[i].map && g_ctmaps[i].fd == s.fd && g_ctmaps[i].len >= need) {
+        const bool same = have_identity
+                              ? (g_ctmaps[i].dev == need_dev && g_ctmaps[i].ino == need_ino)
+                              : (g_ctmaps[i].fd == s.fd);
+        if (g_ctmaps[i].map && same && g_ctmaps[i].len >= need) {
+            g_ctmaps[i].users++;
             *base = g_ctmaps[i].map; *len = g_ctmaps[i].len;
 #if HAVE_DMABUF_SYNC
             struct dma_buf_sync sy = {};
@@ -723,10 +1035,20 @@ static bool ct_map(const CtSnap& s, bool write, uint8_t** base, size_t* len) {
             return true;
         }
     }
-    int i = g_ctmap_next++ & 3;
-    if (g_ctmaps[i].map) { munmap(g_ctmaps[i].map, g_ctmaps[i].len); g_ctmaps[i].map = nullptr; }
+    int i = -1;
+    for (int n = 0; n < 4; ++n) {
+        const int cand = (g_ctmap_next + n) & 3;
+        if (g_ctmaps[cand].users == 0) { i = cand; break; }
+    }
+    if (i < 0) {
+        LOGE("client target map cache busy (4 active leases)");
+        return false;
+    }
+    g_ctmap_next = (i + 1) & 3;
+    ct_map_evict(i);
     int prot = PROT_READ | (write ? PROT_WRITE : 0);
     void* p = MAP_FAILED;
+    int ion_handle = -1, map_fd = -1;
     // The vendor's converter maps its buffers through ION (import + map), which
     // gives a cached CPU mapping. A plain mmap of the same dma-buf is uncached
     // on this kernel (~13 MB/s, 80 ms for a 1440x720 frame), so prefer ION.
@@ -735,14 +1057,14 @@ static bool ct_map(const CtSnap& s, bool write, uint8_t** base, size_t* len) {
         if (g_ion_fd >= 0) {
             int handle = 0;
             if (p_ion_import(s.fd, &handle) == 0) {
+                ion_handle = handle;
                 unsigned char* ptr = nullptr;
-                int mfd = -1;
-                if (p_ion_map(g_ion_fd, handle, need, prot, MAP_SHARED, 0, &ptr, &mfd) == 0 &&
+                if (p_ion_map(g_ion_fd, handle, need, prot, MAP_SHARED, 0, &ptr, &map_fd) == 0 &&
                     ptr) {
                     p = (void*)ptr;
                     if (g_log >= 1 && g_ctmap_next <= 4)
                         LOGI("ct_map: ion import/map ok (fd=%d %zu bytes, map_fd=%d)",
-                             s.fd, need, mfd);
+                             s.fd, need, map_fd);
                 } else {
                     if (g_log >= 1 && g_ctmap_next <= 4)
                         LOGE("ct_map: ion_map failed: %s", strerror(errno));
@@ -752,13 +1074,23 @@ static bool ct_map(const CtSnap& s, bool write, uint8_t** base, size_t* len) {
             }
         }
     }
-    if (p == MAP_FAILED) p = mmap(nullptr, need, prot, MAP_SHARED, s.fd, 0);
+    if (p == MAP_FAILED) {
+        // The import owns a kernel reference; release it before using raw mmap.
+        if (ion_handle >= 0 && g_ion_fd >= 0 && p_ion_free) {
+            p_ion_free(g_ion_fd, ion_handle);
+            ion_handle = -1;
+        }
+        if (map_fd >= 0) { close(map_fd); map_fd = -1; }
+        p = mmap(nullptr, need, prot, MAP_SHARED, s.fd, 0);
+    }
     if (p == MAP_FAILED) {
         LOGE("client target mmap(fd=%d, %zu) failed: %s", s.fd, need, strerror(errno));
-        g_ctmaps[i].fd = -1;
+        if (ion_handle >= 0 && g_ion_fd >= 0 && p_ion_free) p_ion_free(g_ion_fd, ion_handle);
+        if (map_fd >= 0) close(map_fd);
         return false;
     }
-    g_ctmaps[i] = CtMap{ s.fd, (uint8_t*)p, need };
+    g_ctmaps[i] = CtMap{ s.fd, (uint8_t*)p, need, need_dev, need_ino,
+                         ion_handle, map_fd, 1 };
 #if HAVE_DMABUF_SYNC
     struct dma_buf_sync sy = {};
     sy.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ | (write ? DMA_BUF_SYNC_WRITE : 0);
@@ -775,6 +1107,25 @@ static void ct_unmap_sync(const CtSnap& s, bool wrote) {
     ioctl(s.fd, DMA_BUF_IOCTL_SYNC, &sy);
 #endif
     (void)s; (void)wrote;
+    pthread_mutex_lock(&g_ctmap_lock);
+    uint64_t dev = 0, ino = 0;
+    if (fd_identity(s.fd, &dev, &ino)) {
+        for (int i = 0; i < 4; ++i) {
+            if (g_ctmaps[i].map && g_ctmaps[i].dev == dev && g_ctmaps[i].ino == ino &&
+                g_ctmaps[i].users > 0) {
+                g_ctmaps[i].users--;
+                break;
+            }
+        }
+    } else {
+        for (int i = 0; i < 4; ++i) {
+            if (g_ctmaps[i].map && g_ctmaps[i].fd == s.fd && g_ctmaps[i].users > 0) {
+                g_ctmaps[i].users--;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_ctmap_lock);
 }
 
 // Compare the client target with the previous committed frame and return the
@@ -945,6 +1296,540 @@ static inline void clamp_panel(Rect& q) {
     if (q.b > g_panel_h - 1) q.b = g_panel_h - 1;
 }
 
+// Convert through a separate process. gralloc.rogue can import and cache-lock a
+// foreign SurfaceFlinger handle in a normal helper process (~2.2 ms), but faults
+// when the same import is done inside the vendor composer. The helper returns an
+// RGBA-backed dma-buf whose first width*height bytes are packed gray8.
+static void xproc_disconnect_locked() {
+    if (g_xproc_sock >= 0) close(g_xproc_sock);
+    g_xproc_sock = -1;
+}
+
+static bool xproc_accept_locked() {
+    // HWC owns an abstract listener, so there is no filesystem path for the
+    // composer to search and no socket-file label to relax. The root helper
+    // connects to us and stays in its own process/domain. Keep the connection
+    // persistent across frames unless an error occurs.
+    if (g_xproc_sock >= 0) {
+        pollfd sp{g_xproc_sock, POLLIN, 0};
+        const int polled = poll(&sp, 1, 0);
+        if (polled == 0) {
+            if (g_xproc_attempts >= 3) {
+                timeval timeout{0, 350 * 1000};
+                setsockopt(g_xproc_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+                setsockopt(g_xproc_sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+            }
+            return true;
+        }
+        // Any readable/error/hup state is unexpected between complete
+        // SOCK_SEQPACKET exchanges; discard it and accept a fresh helper.
+        xproc_disconnect_locked();
+    }
+    if (g_xproc_listen < 0) {
+        int listener = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+        if (listener < 0) return false;
+        constexpr const char* name = "hwcgray_hwc";
+        sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        addr.sun_path[0] = '\0';
+        snprintf(addr.sun_path + 1, sizeof(addr.sun_path) - 1, "%s", name);
+        const socklen_t len = (socklen_t)(offsetof(sockaddr_un, sun_path) + 1 + strlen(name));
+        if (bind(listener, reinterpret_cast<sockaddr*>(&addr), len) != 0 ||
+            listen(listener, 4) != 0) {
+            close(listener);
+            return false;
+        }
+        g_xproc_listen = listener;
+    }
+
+    pollfd p{g_xproc_listen, POLLIN, 0};
+    if (poll(&p, 1, 50) <= 0) return false;
+    int fd = accept(g_xproc_listen, nullptr, nullptr);
+    if (fd < 0) return false;
+    const int timeout_ms = g_xproc_attempts < 3 ? 3000 : 350;
+    timeval timeout{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
+        close(fd);
+        return false;
+    }
+    g_xproc_sock = fd;
+    return true;
+}
+
+static void vendor_capture_commit_fd(int fd) {
+    if (fd < 0) return;
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < g_vendor_commit_fd_count; ++i) {
+        if (g_vendor_commit_fds[i] == fd) { pthread_mutex_unlock(&g_lock); return; }
+    }
+    int copy = dup(fd);
+    if (copy < 0) { pthread_mutex_unlock(&g_lock); return; }
+    if (g_vendor_commit_fd_count < 4) {
+        g_vendor_commit_fds[g_vendor_commit_fd_count++] = copy;
+    } else {
+        const int slot = g_vendor_commit_fd_next++ % 4;
+        close(g_vendor_commit_fds[slot]);
+        g_vendor_commit_fds[slot] = copy;
+    }
+    pthread_mutex_unlock(&g_lock);
+    LOGI("xproc captured vendor commit fd=%d (pool=%d)", fd, g_vendor_commit_fd_count);
+}
+
+// Retained only for the rejected direct-commit experiment. The supported
+// xproc_vendor path always passes the exact job destination fd instead.
+static int vendor_pick_commit_fd(void* dst) {
+    (void)dst;
+    pthread_mutex_lock(&g_lock);
+    int fd = -1;
+    if (g_vendor_commit_fd_count >= 2) {
+        const int slot = g_vendor_commit_fd_next++ % g_vendor_commit_fd_count;
+        fd = dup(g_vendor_commit_fds[slot]);
+    }
+    pthread_mutex_unlock(&g_lock);
+    return fd;
+}
+
+static int xproc_send_raw_output(int sock, int raw_fd) {
+    uint32_t magic = kRawOutputMagic;
+    char control[CMSG_SPACE(sizeof(int))];
+    memset(control, 0, sizeof(control));
+    iovec iov{&magic, sizeof(magic)};
+    msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+    cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &raw_fd, sizeof(raw_fd));
+    msg.msg_controllen = cmsg->cmsg_len;
+    return sendmsg(sock, &msg, MSG_NOSIGNAL) < 0 ? -errno : 0;
+}
+
+// GraphicBuffer::flatten/unflatten wire format (frameworks/native/libs/ui).
+// Sending it directly avoids importing/locking the client target in the composer,
+// which gralloc.rogue rejects even though the helper can import the same GB01.
+static int xproc_send_input(int fd, const CtSnap& s, const native_handle_t* handle) {
+    if (!handle || handle->numFds <= 0 || handle->numFds > 128 || handle->numInts < 0 ||
+        handle->numInts > 128) return -1;
+    const size_t words = 13 + (size_t)handle->numInts;
+    int32_t* buf = static_cast<int32_t*>(calloc(words, sizeof(int32_t)));
+    if (!buf) return -1;
+    buf[0] = (int32_t)kGbMagic;
+    buf[1] = s.w;
+    buf[2] = s.h;
+    buf[3] = s.stride;
+    buf[4] = s.format;
+    buf[5] = 1;
+    // Match the AHardwareBuffer usage bits used by the known-good SF-shaped
+    // source allocation (CPU read/write rarely + GPU sampled/framebuffer).
+    buf[6] = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+             AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER |
+             AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
+             AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY;
+    buf[7] = 1;
+    buf[10] = handle->numFds;
+    buf[11] = handle->numInts;
+    if (handle->numInts)
+        memcpy(buf + 13, handle->data + handle->numFds, (size_t)handle->numInts * sizeof(int32_t));
+
+    char control[CMSG_SPACE(128 * sizeof(int))];
+    memset(control, 0, sizeof(control));
+    iovec iov{buf, words * sizeof(int32_t)};
+    msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+    cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN((size_t)handle->numFds * sizeof(int));
+    memcpy(CMSG_DATA(cmsg), handle->data, (size_t)handle->numFds * sizeof(int));
+    msg.msg_controllen = cmsg->cmsg_len;
+    const ssize_t sent = sendmsg(fd, &msg, MSG_NOSIGNAL);
+    free(buf);
+    return sent < 0 ? -errno : 0;
+}
+
+// The staging-copy skip is safe only in the fast waveform family. HD 256 and
+// Regal use a different vendor buffer/compare path and can crash in processImage
+// when the staging copy is omitted. Read the live property here so a mode switch
+// takes effect on the next frame rather than after the knob reload interval.
+static bool xproc_mode_is_fast() {
+    char buf[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("vendor.xrz.global_refresh_mode", buf) <= 0) return false;
+    const int mode = atoi(buf);
+    // A2, Fast, Extreme and Hyper (0xb7). HD/HD256/Regal must stay on the full
+    // vendor conversion/copy path. Never infer the current mode from the previous
+    // commit: that can re-enable the helper one frame after a quality-mode switch.
+    return mode == 16 || mode == 178 || mode == 179 || mode == 183;
+}
+
+// A timed-out request may still be writing the same frame's snapshot into the
+// destination. Treat that destination as unavailable for the retry window; the
+// vendor path then owns it. Because the helper is fed a job-bound snapshot, a
+// late write is at worst the same frame, never a newer/older client target.
+static void quarantine_dest_fd(int fd, uint64_t duration_ms) {
+    uint64_t dev = 0, ino = 0;
+    if (!fd_identity(fd, &dev, &ino)) return;
+    const uint64_t until = now_ns() + duration_ms * 1000000ull;
+    pthread_mutex_lock(&g_lock);
+    int slot = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (g_dest_quarantine[i].until_ns <= now_ns() ||
+            (g_dest_quarantine[i].dev == dev && g_dest_quarantine[i].ino == ino)) {
+            slot = i;
+            break;
+        }
+        if (g_dest_quarantine[i].until_ns < g_dest_quarantine[slot].until_ns) slot = i;
+    }
+    g_dest_quarantine[slot] = DestQuarantine{ dev, ino, until };
+    pthread_mutex_unlock(&g_lock);
+    if (g_log >= 1)
+        LOGW("xproc quarantined destination ino=%llu for %llums",
+             (unsigned long long)ino, (unsigned long long)duration_ms);
+}
+
+static bool xproc_circuit_open() {
+    const uint64_t retry = __atomic_load_n(&g_xproc_retry_after_ns, __ATOMIC_RELAXED);
+    return retry != 0 && now_ns() < retry;
+}
+
+static bool dest_quarantined_locked(uint64_t dev, uint64_t ino) {
+    const uint64_t now = now_ns();
+    for (int i = 0; i < 4; ++i) {
+        if (g_dest_quarantine[i].until_ns > now &&
+            g_dest_quarantine[i].dev == dev && g_dest_quarantine[i].ino == ino)
+            return true;
+    }
+    return false;
+}
+
+static bool dest_quarantined_fd(int fd) {
+    uint64_t dev = 0, ino = 0;
+    if (!fd_identity(fd, &dev, &ino)) return false;
+    pthread_mutex_lock(&g_lock);
+    const bool quarantined = dest_quarantined_locked(dev, ino);
+    pthread_mutex_unlock(&g_lock);
+    return quarantined;
+}
+
+static void request_helper_recovery() {
+    const uint64_t now = now_ns();
+    if (g_helper_recovery_set &&
+        g_helper_recovery_last_ns && now - g_helper_recovery_last_ns < 2000000000ull)
+        return;
+    g_helper_recovery_last_ns = now;
+    g_helper_recovery_set = true;
+    __system_property_set("vendor.debug.hwc.shim.helper_recovery", "1");
+}
+
+// The helper writes the whole frame into the exact vendor CommitBuffer dma-buf
+// resolved for this job. `mtk_commit` still receives the vendor's own unmodified
+// cfg/fd; no destination-fd guess or cfg rewrite is used.
+static void job_end() {
+    ct_snap_release(&t_job.snap);
+    if (t_job.dst_fd >= 0) close(t_job.dst_fd);
+    t_job.active = false;
+    t_job.matched = false;
+    t_job.copy_skipped = false;
+    t_job.helper_done = false;
+    t_job.helper_ambiguous = false;
+    t_job.fence_waited = false;
+    t_job.self = nullptr;
+    t_job.param = nullptr;
+    t_job.ci = nullptr;
+    t_job.dst_fd = -1;
+    t_job.src_dev = 0;
+    t_job.src_ino = 0;
+    t_job.dst_dev = 0;
+    t_job.dst_ino = 0;
+    t_job.seq = 0;
+    t_job.damage_l = 0;
+    t_job.damage_t = 0;
+    t_job.damage_r = -1;
+    t_job.damage_b = -1;
+    t_job.damage_valid = false;
+}
+
+// Resolve the exact vendor CommitBuffer fd whose GraphicBuffer is being locked
+// as the processImage output. processImage selects a slot under +0x428, then
+// locks CommitBuffer+0x8 with usage 0x30 before convertToGray. Matching the
+// GraphicBuffer object here is stronger than guessing from pool state early.
+static int vendor_resolve_job_dst_fd(void* self, void* graphic_buffer) {
+    if (!self || !graphic_buffer || !g_buildid_ok) return -1;
+    uint8_t* eng = static_cast<uint8_t*>(self);
+    pthread_mutex_t* mtx = reinterpret_cast<pthread_mutex_t*>(eng + 0x428);
+    int fd = -1;
+    pthread_mutex_lock(mtx);
+    static const size_t kSlots[3] = { 0x610, 0x618, 0x620 };
+    for (size_t off : kSlots) {
+        uint8_t* cb = *reinterpret_cast<uint8_t* const*>(eng + off);
+        if (!cb) continue;
+        void* gb = *reinterpret_cast<void* const*>(cb + 0x08);
+        if (gb != graphic_buffer) continue;
+        const int cand = *reinterpret_cast<const int32_t*>(cb + 0x18);
+        if (cand >= 0) fd = dup(cand);
+        break;
+    }
+    pthread_mutex_unlock(mtx);
+    return fd;
+}
+
+// Bind the worker's current job to the exact client target named by
+// OverlayPortParam+0x78 (BuildID-gated). +0x78 is the source CT fd, not the
+// commit destination. If the identity does not match a snapshot we keep the
+// vendor path intact instead of guessing "latest frame".
+static void job_begin(void* self, void* param, void* ci) {
+    job_end();
+    t_job.active = true;
+    t_job.self = self;
+    t_job.param = param;
+    t_job.ci = ci;
+    if (!g_xproc_vendor || !g_buildid_ok || !param) return;
+
+    const int src_fd = *(const int32_t*)((const uint8_t*)param + 0x78);
+    if (src_fd < 0) return;
+    fd_identity(src_fd, &t_job.src_dev, &t_job.src_ino);
+
+    pthread_mutex_lock(&g_lock);
+    t_job.matched = snap_hist_clone_by_fd_locked(src_fd, &t_job.snap, &t_job.seq);
+    t_job.damage_l = g_pend_ct.l;
+    t_job.damage_t = g_pend_ct.t;
+    t_job.damage_r = g_pend_ct.r;
+    t_job.damage_b = g_pend_ct.b;
+    t_job.damage_valid = !rect_empty(g_pend_ct) && g_pend_ct_rects > 0;
+    bool latest_fallback = false;
+    if (!t_job.matched && g_snap.valid) {
+        // Some vendor paths carry a layer/staging fd at +0x78 rather than the
+        // CT. Bind the latest accepted CT at job start (not at conversion), so
+        // a newer setClientTarget cannot swap it mid-job.
+        t_job.matched = ct_snap_clone_locked(g_snap, &t_job.snap);
+        t_job.seq = (uint64_t)g_snap_seq;
+        latest_fallback = t_job.matched;
+    }
+    pthread_mutex_unlock(&g_lock);
+    if (g_log >= 1 && (g_st_pi.n < 6 || (g_st_pi.n % 120) == 0))
+        LOGI("xproc job param=%p ci=%p src_fd=%d src_ino=%llu snapshot=%s seq=%llu",
+             param, ci, src_fd, (unsigned long long)t_job.src_ino,
+             t_job.matched ? (latest_fallback ? "latest" : "matched") : "missing",
+             (unsigned long long)t_job.seq);
+}
+
+// Same-frame fallback when the helper fails after we skipped the vendor staging
+// copy: convert the job-bound snapshot straight into the vendor's locked
+// destination buffer (`dst` in `hook_convert_to_gray`).
+static bool job_direct_fallback(void* dst_ptr, int w, int h, int dst_pitch) {
+    if (!t_job.matched || !t_job.snap.valid || !t_job.fence_waited ||
+        !dst_ptr || w <= 0 || h <= 0 || dst_pitch < w) return false;
+    if (t_job.snap.w != w || t_job.snap.h != h) return false;
+    uint8_t* base = nullptr;
+    size_t len = 0;
+    if (!ct_map(t_job.snap, false, &base, &len)) return false;
+    gray_conv((uint8_t*)dst_ptr, base, w, h, t_job.snap.stride * 4, dst_pitch,
+              g_helper_onebit != 0);
+    ct_unmap_sync(t_job.snap, false);
+    return true;
+}
+
+static int xproc_recv_output(int fd, const CtSnap& s) {
+    constexpr size_t kMaxWords = 4096;
+    int32_t* buf = static_cast<int32_t*>(malloc(kMaxWords * sizeof(int32_t)));
+    if (!buf) return -1;
+    char control[CMSG_SPACE(128 * sizeof(int))];
+    memset(control, 0, sizeof(control));
+    iovec iov{buf, kMaxWords * sizeof(int32_t)};
+    msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+    const ssize_t got = recvmsg(fd, &msg, 0);
+    if (got < 0 || (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
+        free(buf);
+        return -1;
+    }
+
+    cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+    int fd_count = 0;
+    int* received_fds = nullptr;
+    if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
+        cmsg->cmsg_len >= CMSG_LEN(0)) {
+        fd_count = (int)(cmsg->cmsg_len - CMSG_LEN(0)) / (int)sizeof(int);
+        received_fds = reinterpret_cast<int*>(CMSG_DATA(cmsg));
+    }
+
+    int result = -1;
+    if (got >= (ssize_t)sizeof(int32_t) && (uint32_t)buf[0] == kGrayErrorMagic) {
+        if (got >= (ssize_t)(6 * sizeof(int32_t)) && g_log >= 1)
+            LOGW("xproc helper error status=%d native=%d", buf[2], buf[3]);
+    } else if (got >= (ssize_t)(13 * sizeof(int32_t)) &&
+               (uint32_t)buf[0] == kGbMagic && received_fds && fd_count > 0) {
+        const int num_fds = buf[10], num_ints = buf[11];
+        const size_t need = (size_t)(13 + (num_ints > 0 ? num_ints : 0)) * sizeof(int32_t);
+        if (num_fds > 0 && num_fds <= 128 && num_ints >= 0 && num_ints < 4096 &&
+            (size_t)got >= need && fd_count >= num_fds &&
+            buf[1] == s.w && buf[2] == s.h && buf[3] >= s.w && buf[4] == 1 && buf[5] == 1) {
+            result = dup(received_fds[0]);
+        }
+    }
+    for (int i = 0; i < fd_count; ++i) close(received_fds[i]);
+    if (result < 0 && g_log >= 1) {
+        static int reply_logs;
+        if (reply_logs++ < 8) {
+            char detail[96] = {0};
+            if (got >= (ssize_t)(6 * sizeof(int32_t))) {
+                snprintf(detail, sizeof(detail), "words=%08x,%u,%u,%u,%u,%u",
+                         buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]);
+            }
+            LOGW("xproc reply invalid got=%zd flags=0x%x fds=%d %s",
+                 got, (unsigned)msg.msg_flags, fd_count, detail);
+        }
+    }
+    free(buf);
+    return result;
+}
+
+static int xproc_convert(const CtSnap& s, uint32_t mode, int* out_stride, bool raw_output,
+                         void* raw_dst = nullptr, int raw_fd_override = -1,
+                         bool* ambiguous = nullptr, Rect damage = { 0, 0, -1, -1 }) {
+    if (out_stride) *out_stride = 0;
+    if (ambiguous) *ambiguous = false;
+    if (!s.valid || !s.handle) return -1;
+    if (raw_output && raw_fd_override >= 0 && dest_quarantined_fd(raw_fd_override)) {
+        if (ambiguous) *ambiguous = false;
+        if (g_log >= 1)
+            LOGW("xproc exact vendor destination is quarantined; keeping vendor converter");
+        return -1;
+    }
+    if (xproc_circuit_open()) {
+        __atomic_store_n(&g_xproc_ready, 0, __ATOMIC_RELAXED);
+        return -1;
+    }
+    const uint64_t started = now_ns();
+    ++g_xproc_attempts;
+    int result_fd = -1;
+    int raw_output_fd = -1;
+    bool raw_sent = false;
+    const char* fail_stage = "accept";
+    native_handle_t* request_handle = nullptr;
+    GrayRequest request{};
+    Rect d = damage;
+    bool partial = false;
+
+    pthread_mutex_lock(&g_xproc_lock);
+    if (!xproc_accept_locked()) goto done;
+    fail_stage = "clone";
+    pthread_mutex_lock(&g_lock);
+    request_handle = native_handle_clone(s.handle);
+    pthread_mutex_unlock(&g_lock);
+    if (!request_handle) goto done;
+    fail_stage = "rawfd";
+    if (raw_output) {
+        // The vendor path knows the exact destination fd for this job. Never
+        // use the old round-robin pool there: a wrong destination feeds another
+        // frame's buffer into the commit being prepared right now.
+        raw_output_fd = raw_fd_override >= 0 ? dup(raw_fd_override)
+                                             : vendor_pick_commit_fd(raw_dst);
+        if (raw_output_fd < 0) goto done;
+    }
+
+    if (raw_output && g_xproc_damage && g_xform == 0 && !rect_empty(d) &&
+        s.w > 0 && s.h > 0 && (s.w % 4) == 0) {
+        if (d.l < 0) d.l = 0;
+        if (d.t < 0) d.t = 0;
+        if (d.r >= s.w) d.r = s.w - 1;
+        if (d.b >= s.h) d.b = s.h - 1;
+        const long changed = area(d);
+        const long total = (long)s.w * (long)s.h;
+        // A bounding union of several small rects can be mostly empty. Full
+        // conversion is faster and safer once damage covers most of the frame.
+        partial = changed > 0 && total > 0 && changed * 4 < total * 3;
+    }
+    request.magic = kGrayMagic;
+    request.version = 2;
+    request.width = (uint32_t)s.w;
+    request.height = (uint32_t)s.h;
+    request.onebit = g_helper_onebit ? 1u : 0u;
+    request.reserved = raw_output ? 1u : 0u;
+    request.left = partial ? (uint32_t)d.l : UINT32_MAX;
+    request.top = partial ? (uint32_t)d.t : UINT32_MAX;
+    request.right = partial ? (uint32_t)d.r : UINT32_MAX;
+    request.bottom = partial ? (uint32_t)d.b : UINT32_MAX;
+    if (partial) {
+        g_xproc_partial++;
+        g_xproc_partial_pixels += (uint64_t)area(d);
+    } else {
+        g_xproc_full++;
+    }
+    fail_stage = "send_header";
+    if (send(g_xproc_sock, &request, sizeof(request), MSG_NOSIGNAL) != (ssize_t)sizeof(request))
+        goto done;
+    fail_stage = "send_input";
+    if (xproc_send_input(g_xproc_sock, s, request_handle) != 0) goto done;
+    fail_stage = "send_raw";
+    if (raw_output && xproc_send_raw_output(g_xproc_sock, raw_output_fd) != 0) goto done;
+    raw_sent = raw_output;
+    fail_stage = "recv";
+    result_fd = xproc_recv_output(g_xproc_sock, s);
+    if (result_fd < 0) goto done;
+    if (raw_output) {
+        // The helper's reply acknowledges that the vendor target was populated.
+        // Commit the vendor fd, never the helper's separately allocated backing.
+        close(result_fd);
+        result_fd = dup(raw_output_fd);
+        if (result_fd < 0) goto done;
+    }
+    if (out_stride) *out_stride = s.w;
+    stat_add(&g_st_xproc, (now_ns() - started) / 1000);
+
+done:
+    if (result_fd < 0) {
+        // Fail safe: once the helper is unavailable, stop skipping the vendor's
+        // staging copy. Otherwise the fallback converter reads stale data and
+        // the physical panel can remain frozen even though commits still return.
+        __atomic_store_n(&g_xproc_ready, 0, __ATOMIC_RELAXED);
+        g_xproc_fails++;
+        const int consecutive = ++g_xproc_consec_fails;
+        if (raw_sent && raw_output_fd >= 0) {
+            if (ambiguous) *ambiguous = true;
+            quarantine_dest_fd(raw_output_fd, 8000);
+        }
+        if (consecutive >= 3) {
+            __atomic_store_n(&g_xproc_retry_after_ns,
+                             now_ns() + 2000000000ull, __ATOMIC_RELAXED);
+        }
+        const uint64_t last_ok = __atomic_load_n(&g_xproc_last_success_ns,
+                                                 __ATOMIC_RELAXED);
+        if (consecutive >= 10 &&
+            (last_ok == 0 || now_ns() - last_ok > 10000000000ull)) {
+            request_helper_recovery();
+        }
+        if (g_log >= 1 && (g_xproc_fails <= 4 || (g_xproc_fails % 20) == 0))
+            LOGW("xproc convert failed stage=%s after %lluus (calls=%llu failures=%llu consecutive=%d)",
+                 fail_stage, (unsigned long long)((now_ns() - started) / 1000),
+                 (unsigned long long)g_st_xproc.n, (unsigned long long)g_xproc_fails,
+                 consecutive);
+    } else {
+        g_xproc_consec_fails = 0;
+        __atomic_store_n(&g_xproc_last_success_ns, now_ns(), __ATOMIC_RELAXED);
+        __atomic_store_n(&g_xproc_retry_after_ns, 0, __ATOMIC_RELAXED);
+        if (g_helper_recovery_set) {
+            g_helper_recovery_set = false;
+            __system_property_set("vendor.debug.hwc.shim.helper_recovery", "0");
+        }
+    }
+    if (raw_output_fd >= 0) close(raw_output_fd);
+    if (request_handle) native_handle_delete(request_handle);
+    if (result_fd < 0) xproc_disconnect_locked();
+    pthread_mutex_unlock(&g_xproc_lock);
+    return result_fd;
+}
+
 // The commit we own. Returns the ioctl result, or -1 when nothing was done.
 static int fast_commit(CtSnap s, Rect q, uint32_t mode, uint32_t dither, bool inplace) {
     eink_update_config c = {};
@@ -961,7 +1846,17 @@ static int fast_commit(CtSnap s, Rect q, uint32_t mode, uint32_t dither, bool in
     c.flag = 1;
 
     bool own = false;
-    if (g_ownbuf && ob_alloc(s.w, s.h)) {
+    int xproc_fd = -1;
+    int xproc_stride = 0;
+    if (g_xproc) {
+        xproc_fd = xproc_convert(s, mode, &xproc_stride, true);
+        if (xproc_fd < 0) return -1;
+        c.fd = xproc_fd;
+        c.format = 0;
+        c.stride = (uint32_t)(xproc_stride > 0 ? xproc_stride : s.w);
+        c.height = (uint32_t)s.h;
+        own = true;
+    } else if (g_ownbuf && ob_alloc(s.w, s.h)) {
         int i = g_ob_next++ % g_ob_count;
         uint8_t* base = nullptr; size_t len = 0;
         if (ct_map(s, false, &base, &len)) {
@@ -985,13 +1880,34 @@ static int fast_commit(CtSnap s, Rect q, uint32_t mode, uint32_t dither, bool in
     }
     if (g_ownbuf && !own) return -1;
 
+    if (xproc_fd >= 0) {
+#if HAVE_DMABUF_SYNC
+        struct dma_buf_sync sy = {};
+        sy.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
+        const int sync_ret = ioctl(xproc_fd, DMA_BUF_IOCTL_SYNC, &sy);
+        if (g_log >= 2 || (g_log >= 1 && g_fast_commits < 3))
+            LOGI("xproc dma-buf END/WRITE sync ret=%d errno=%d", sync_ret, errno);
+#else
+        (void)xproc_fd;
+#endif
+    }
+
     uint64_t t0 = now_ns();
     pthread_mutex_lock(&g_commit_lock);
     int ret = real_mtk_commit(&c);
     pthread_mutex_unlock(&g_commit_lock);
+    if (xproc_fd >= 0) close(xproc_fd);
     uint64_t us = (now_ns() - t0) / 1000;
+    uint64_t dt_us = 0;
 
     if (ret == 0) {
+        const uint64_t commit_ns = now_ns();
+        if (g_last_fast_commit_ns) {
+            dt_us = (commit_ns - g_last_fast_commit_ns) / 1000;
+            g_fast_dt_sum += dt_us;
+            if (dt_us > g_fast_dt_max) g_fast_dt_max = dt_us;
+        }
+        g_last_fast_commit_ns = commit_ns;
         __atomic_add_fetch(&g_fast_commits, 1, __ATOMIC_RELAXED);
         __atomic_add_fetch(&g_fast_us_sum, us, __ATOMIC_RELAXED);
         uint64_t m = __atomic_load_n(&g_fast_us_max, __ATOMIC_RELAXED);
@@ -1001,21 +1917,66 @@ static int fast_commit(CtSnap s, Rect q, uint32_t mode, uint32_t dither, bool in
         __atomic_add_fetch(&g_fast_fails, 1, __ATOMIC_RELAXED);
     }
     if (g_log >= 2 || (g_log >= 1 && (g_fast_commits % (uint64_t)g_log_every) == 0))
-        LOGI("fast #%llu %s [%d,%d,%d,%d] mode=0x%x fmt=%d stride=%d h=%d ioctl=%lluus wait=%lluus sync=%lluus ret=%d",
+        LOGI("fast #%llu %s [%d,%d,%d,%d] mode=0x%x fmt=%d stride=%d h=%d ioctl=%lluus dt=%lluus wait=%lluus sync=%lluus ret=%d",
              (unsigned long long)g_fast_commits,
-             own ? "own-gray" : (inplace ? "gray-inplace" : "rgba"),
+             own ? (g_xproc ? "xproc-gray" : "own-gray") : (inplace ? "gray-inplace" : "rgba"),
              q.l, q.t, q.r, q.b, mode, c.format, c.stride, c.height,
-             (unsigned long long)us, (unsigned long long)g_last_wait_us,
+             (unsigned long long)us, (unsigned long long)dt_us,
+             (unsigned long long)g_last_wait_us,
              (unsigned long long)g_last_sync_us, ret);
     return ret;
+}
+
+static void probe_vendor_commit_fd(int fd, uint32_t stride, uint32_t height) {
+    static int seen[8];
+    static int nseen;
+    for (int i = 0; i < nseen; ++i) if (seen[i] == fd) return;
+    if (nseen >= 8) return;
+    seen[nseen++] = fd;
+    const size_t len = (size_t)stride * height;
+    void* map = mmap(nullptr, len, PROT_READ, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        LOGW("vendor fd probe %d mmap %zu failed: %s", fd, len, strerror(errno));
+        return;
+    }
+    uint8_t* copy = static_cast<uint8_t*>(malloc(len));
+    if (!copy) { munmap(map, len); return; }
+    const uint64_t t0 = now_ns();
+    memcpy(copy, map, len);
+    const uint64_t us = (now_ns() - t0) / 1000;
+    uint64_t sum = 0;
+    for (size_t i = 0; i < len; i += 4096) sum += copy[i];
+    LOGI("vendor fd probe fd=%d bytes=%zu read=%lluus MB/s=%.1f checksum=%llu",
+         fd, len, (unsigned long long)us,
+         us ? (double)len / (double)us : 0.0,
+         (unsigned long long)sum);
+    free(copy);
+    munmap(map, len);
 }
 
 // Called on the vendor's e-ink worker with a pointer to the caller's by-value
 // eink_update_config, so it is safe to rewrite in place.
 static int hook_mtk_commit(eink_update_config* cfg) {
     maybe_reload_knobs();
+    if (cfg) {
+        pthread_mutex_lock(&g_lock);
+        const bool drop = g_drop_next_commit;
+        if (drop) g_drop_next_commit = false;
+        pthread_mutex_unlock(&g_lock);
+        if (drop) {
+            LOGW("dropping commit after helper/fallback failure");
+            return 0;
+        }
+        if (g_xproc && !g_xproc_vendor) vendor_capture_commit_fd(cfg->fd);
+    }
     if (!g_fast) __atomic_store_n(&g_fast_active, 0, __ATOMIC_RELAXED);
     if (__atomic_load_n(&g_fast_active, __ATOMIC_RELAXED)) {
+        // Keep policy changes from E-ink Center visible to our next fast commit
+        // even though the vendor's physical commit is suppressed.
+        if (cfg) {
+            __atomic_store_n(&g_vendor_mode, cfg->mode, __ATOMIC_RELAXED);
+            __atomic_store_n(&g_last_vendor_dither, cfg->dither, __ATOMIC_RELAXED);
+        }
         __atomic_add_fetch(&g_fast_skips, 1, __ATOMIC_RELAXED);
         return 0;
     }
@@ -1038,7 +1999,7 @@ static int hook_mtk_commit(eink_update_config* cfg) {
 
     const uint32_t vm = cfg->mode;
     Rect vr = { (int)cfg->left, (int)cfg->top, (int)cfg->right, (int)cfg->bottom };
-    g_last_vendor_dither = cfg->dither;
+    __atomic_store_n(&g_last_vendor_dither, cfg->dither, __ATOMIC_RELAXED);
 
     if (vr.r > 0 && (int)cfg->right + 1 > g_panel_w) g_panel_w = (int)cfg->right + 1;
     if (vr.b > 0 && (int)cfg->bottom + 1 > g_panel_h) g_panel_h = (int)cfg->bottom + 1;
@@ -1068,7 +2029,7 @@ static int hook_mtk_commit(eink_update_config* cfg) {
     }
 
     pthread_mutex_lock(&g_lock);
-    g_vendor_mode = vm;
+    __atomic_store_n(&g_vendor_mode, vm, __ATOMIC_RELAXED);
     g_vendor_rect = vr;
     g_new_rect = Rect{ (int)cfg->left, (int)cfg->top, (int)cfg->right, (int)cfg->bottom };
     g_new_mode = cfg->mode;
@@ -1082,11 +2043,19 @@ static int hook_mtk_commit(eink_update_config* cfg) {
     pthread_mutex_lock(&g_commit_lock);
     int ret = real_mtk_commit(cfg);
     pthread_mutex_unlock(&g_commit_lock);
+    if (g_vendor_fd_probe && ret == 0)
+        probe_vendor_commit_fd(cfg->fd, cfg->stride, cfg->height);
     uint64_t ioctl_us = (now_ns() - t0) / 1000;
 
     pthread_mutex_lock(&g_lock);
     g_last_ret = ret;
     pthread_mutex_unlock(&g_lock);
+
+    if (do_log && g_commits <= 3) {
+        LOGI("vendor cfg reserved r18=[%x,%x,%x,%x] r30=[%x,%x] flag=%x",
+             cfg->r18[0], cfg->r18[1], cfg->r18[2], cfg->r18[3],
+             cfg->r30[0], cfg->r30[1], cfg->flag);
+    }
 
     if (do_log) {
         LOGI("commit #%llu dt=%lluus pre=%lluus ioctl=%lluus %s mode=0x%x->0x%x area=(%d,%d,%d,%d)->(%d,%d,%d,%d) "
@@ -1285,6 +2254,21 @@ static void ct_probe(buffer_handle_t target, int fence) {
 static int32_t hook_setClientTarget(hwc2_device_t* dev, hwc2_display_t display,
                                     buffer_handle_t target, int32_t fence,
                                     int32_t dataspace, hwc_region_t damage) {
+    maybe_reload_knobs();
+    CtSnap candidate;
+    uint64_t snap_dev = 0, snap_ino = 0;
+    const bool candidate_ok =
+        snap_build(target, fence, &candidate, &snap_dev, &snap_ino);
+    if (g_ctprobe) ct_probe(target, fence);
+    const int32_t ret =
+        ((PFN_setClientTarget)g_real_fn[FN_SET_CLIENT_TARGET])(dev, display, target,
+                                                               fence, dataspace, damage);
+    if (ret != 0) {
+        if (candidate_ok) ct_snap_release(&candidate);
+        return ret;
+    }
+    ct_query(target);
+    snap_publish(&candidate, candidate_ok, snap_dev, snap_ino);
     if (g_log >= 1 && g_present < 6) {
         char fds[96] = {0};
         if (target) {
@@ -1307,16 +2291,23 @@ static int32_t hook_setClientTarget(hwc2_device_t* dev, hwc2_display_t display,
         }
         g_pend_ct_rects += (int)damage.numRects;
         pthread_mutex_unlock(&g_lock);
+        if (g_log >= 2) {
+            char buf[512] = {0};
+            int n = 0;
+            for (size_t i = 0; i < damage.numRects && n < (int)sizeof(buf) - 32; i++) {
+                const hwc_rect_t& r = damage.rects[i];
+                n += snprintf(buf + n, sizeof(buf) - n, "(%d,%d,%d,%d)",
+                              r.left, r.top, r.right, r.bottom);
+            }
+            LOGI("damage ct n=%zu %s", damage.numRects, buf);
+        }
     }
-    ct_query(target);
-    snap_take(target, fence);
-    if (g_ctprobe) ct_probe(target, fence);
     if (g_ctsrc) ct_import(target);
     if (g_log >= 1 && g_present < 8)
         LOGI("setClientTarget d=%llu handle=%p -> ct fd=%d %dx%d stride=%d vstride=%d fmt=0x%x",
              (unsigned long long)display, (void*)target, g_ct.fd, g_ct.w, g_ct.h,
              g_ct.stride, g_ct.vstride, g_ct.format);
-    return ((PFN_setClientTarget)g_real_fn[FN_SET_CLIENT_TARGET])(dev, display, target, fence, dataspace, damage);
+    return ret;
 }
 
 static int32_t hook_setLayerSurfaceDamage(hwc2_device_t* dev, hwc2_display_t display,
@@ -1331,14 +2322,24 @@ static int32_t hook_setLayerSurfaceDamage(hwc2_device_t* dev, hwc2_display_t dis
         }
         g_pend_layer_rects += (int)damage.numRects;
         pthread_mutex_unlock(&g_lock);
+    } else if (g_xproc) {
+        // A full invalidate is commonly encoded as zero explicit HWC2 rects.
+        // The helper path needs a commit trigger even when the list is empty.
+        pthread_mutex_lock(&g_lock);
+        union_rect(g_pend_layer, 0, 0, g_panel_w - 1, g_panel_h - 1);
+        union_rect(g_last_layer, 0, 0, g_panel_w - 1, g_panel_h - 1);
+        g_pend_layer_rects++;
+        pthread_mutex_unlock(&g_lock);
     }
     if (g_log >= 2) {
-        char buf[512];
+        char buf[512] = {0};
         int n = 0;
-        for (size_t i = 0; i < damage.numRects && n < (int)sizeof(buf) - 32; i++)
-            n += snprintf(buf + n, sizeof(buf) - n, "(%d,%d,%d,%d)",
-                          damage.rects[i].left, damage.rects[i].top,
-                          damage.rects[i].right, damage.rects[i].bottom);
+        if (damage.rects) {
+            for (size_t i = 0; i < damage.numRects && n < (int)sizeof(buf) - 32; i++)
+                n += snprintf(buf + n, sizeof(buf) - n, "(%d,%d,%d,%d)",
+                              damage.rects[i].left, damage.rects[i].top,
+                              damage.rects[i].right, damage.rects[i].bottom);
+        }
         LOGI("damage layer=%llu n=%zu %s", (unsigned long long)layer, damage.numRects, buf);
     }
     return ((PFN_setLayerSurfaceDamage)g_real_fn[FN_SET_LAYER_SURFACE_DAMAGE])(dev, display, layer, damage);
@@ -1396,12 +2397,13 @@ static int32_t hook_presentDisplay(hwc2_device_t* dev, hwc2_display_t display, i
     // Snapshot what SF is presenting and the damage it brought, before the
     // vendor's worker can consume either.
     bool fast = (g_fast != 0);
-    CtSnap s = { -1, -1, 0, 0, 0, 0, 0, false };
+    SnapLease snap_lease;
+    CtSnap& s = snap_lease.snap;
     Rect want = { 0, 0, -1, -1 };
     int seq = 0;
     if (fast) {
         pthread_mutex_lock(&g_lock);
-        s = g_snap;
+        ct_snap_clone_locked(g_snap, &s);
         seq = g_snap_seq;
         want = (g_src == 2) ? g_pend_layer : g_pend_ct;
         if (rect_empty(want)) want = g_pend_layer;   // ct damage is always empty here
@@ -1500,11 +2502,14 @@ static int32_t hook_presentDisplay(hwc2_device_t* dev, hwc2_display_t display, i
                 pthread_mutex_unlock(&g_lock);
             } else {
                 if (inplace) inplace_gray(s, q.t, q.b);
-                uint32_t mode = g_mode >= 0 ? (uint32_t)g_mode
-                              : (g_vendor_mode != 0xffffffff ? g_vendor_mode : 0x11);
+                uint32_t vendor_mode = __atomic_load_n(&g_vendor_mode, __ATOMIC_RELAXED);
+                uint32_t vendor_dither = __atomic_load_n(&g_last_vendor_dither, __ATOMIC_RELAXED);
+                uint32_t selected_mode = g_global_mode >= 0 ? (uint32_t)g_global_mode
+                                      : (vendor_mode != 0xffffffff ? vendor_mode : 0x11);
+                uint32_t mode = g_mode >= 0 ? (uint32_t)g_mode : selected_mode;
                 uint32_t dith = g_dither >= 0 ? (uint32_t)g_dither
                               : (inplace ? 0
-                                 : (g_last_vendor_dither != 0xffffffff ? g_last_vendor_dither : 0));
+                                 : (vendor_dither != 0xffffffff ? vendor_dither : 0));
                 int ret = fast_commit(s, q, mode, dith, inplace);
                 if (ret == 0) {
                     g_consumed_seq = seq;
@@ -1524,8 +2529,9 @@ static int32_t hook_presentDisplay(hwc2_device_t* dev, hwc2_display_t display, i
         }
     }
     if (fast && g_log >= 1 && (g_present % 10) == 0)
-        LOGI("present window %lluus (present #%llu)",
-             (unsigned long long)((now_ns() - tw0) / 1000), (unsigned long long)g_present);
+        LOGI("present window %lluus (present #%llu fast=%d valid=%d seq=%d target=%dx%d)",
+             (unsigned long long)((now_ns() - tw0) / 1000), (unsigned long long)g_present,
+             fast, s.valid, seq, s.w, s.h);
     return e;
 }
 
@@ -1538,11 +2544,13 @@ static int render_summary(char* buf, size_t cap) {
         "[hwcshim] last commit: mode=0x%x area=(%d,%d,%d,%d) ret=%d\n"
         "[hwcshim] last damage: ct=(%d,%d,%d,%d) layer=(%d,%d,%d,%d)\n"
         "[hwcshim] fast=%d active=%d inplace=%d diff=%d vend_hz=%d skipconv=%d commits=%llu skips=%llu fails=%llu "
-        "ioctl avg=%lluus max=%lluus\n"
-        "[hwcshim] client target: fd=%d %dx%d stride=%d vstride=%d fmt=0x%x fence=%d\n",
+        "ioctl avg=%lluus max=%lluus dt avg=%lluus max=%lluus\n"
+        "[hwcshim] xproc=%d calls=%llu failures=%llu avg=%lluus max=%lluus partial=%llu full=%llu partial_pixels=%llu\n"
+        "[hwcshim] client target: fd=%d %dx%d stride=%d vstride=%d fmt=0x%x fence=%d\n"
+        "[hwcshim] exact dst_fd=%d fd_redirect=OFF persistent_socket=ON\n",
         g_rect, g_mode, g_src, g_xform, g_panel_w, g_panel_h, g_display_w, g_display_h,
         (unsigned long long)g_present, (unsigned long long)g_commits, (unsigned long long)g_rewrites,
-        g_vendor_mode, g_vendor_rect.l, g_vendor_rect.t, g_vendor_rect.r, g_vendor_rect.b,
+        __atomic_load_n(&g_vendor_mode, __ATOMIC_RELAXED), g_vendor_rect.l, g_vendor_rect.t, g_vendor_rect.r, g_vendor_rect.b,
         g_new_mode, g_new_rect.l, g_new_rect.t, g_new_rect.r, g_new_rect.b, g_last_ret,
         g_last_ct.l, g_last_ct.t, g_last_ct.r, g_last_ct.b,
         g_last_layer.l, g_last_layer.t, g_last_layer.r, g_last_layer.b,
@@ -1551,7 +2559,14 @@ static int render_summary(char* buf, size_t cap) {
         (unsigned long long)g_fast_fails,
         (unsigned long long)(g_fast_commits ? g_fast_us_sum / g_fast_commits : 0),
         (unsigned long long)g_fast_us_max,
-        g_snap.fd, g_snap.w, g_snap.h, g_snap.stride, g_snap.vstride, g_snap.format, g_snap.fence);
+        (unsigned long long)(g_fast_commits > 1 ? g_fast_dt_sum / (g_fast_commits - 1) : 0),
+        (unsigned long long)g_fast_dt_max,
+        g_xproc, (unsigned long long)g_st_xproc.n, (unsigned long long)g_xproc_fails,
+        (unsigned long long)stat_avg(&g_st_xproc), (unsigned long long)g_st_xproc.max_us,
+        (unsigned long long)g_xproc_partial, (unsigned long long)g_xproc_full,
+        (unsigned long long)g_xproc_partial_pixels,
+        g_snap.fd, g_snap.w, g_snap.h, g_snap.stride, g_snap.vstride, g_snap.format, g_snap.fence,
+        t_job.dst_fd);
     pthread_mutex_unlock(&g_lock);
     return n;
 }
@@ -1588,19 +2603,23 @@ static void hook_dump(hwc2_device_t* dev, uint32_t* outSize, char* outBuffer) {
 // then removes the need for them entirely.
 static __thread uint64_t t_pi_start;
 
+// The vendor's processImage sometimes calls memcmp with a sentinel pointer
+// (0xffffffffffffffff) for its 4 MB staging comparison after the helper has
+// skipped the copy. Entering libc then faults. Reject only clearly invalid
+// large-buffer pointers; all normal comparisons go straight to libc.
 static int hook_memcmp(const void* a, const void* b, size_t n) {
-    uint64_t t0 = now_ns();
-    int r = real_memcmp(a, b, n);
-    uint64_t us = (now_ns() - t0) / 1000;
-    if (n >= 262144) {                       // the frame diff, not property strings
-        stat_add(&g_st_memcmp, us);
-        if (g_log >= 1 && (g_st_memcmp.n % 20) == 0)
-            LOGI("memcmp %lluus n=%zu (calls=%llu avg=%lluus max=%lluus)",
-                 (unsigned long long)us, n, (unsigned long long)g_st_memcmp.n,
-                 (unsigned long long)stat_avg(&g_st_memcmp),
-                 (unsigned long long)g_st_memcmp.max_us);
+    const uintptr_t pa = reinterpret_cast<uintptr_t>(a);
+    const uintptr_t pb = reinterpret_cast<uintptr_t>(b);
+    if (n >= 262144 && (pa < 0x10000u || pb < 0x10000u ||
+                       pa == UINTPTR_MAX || pb == UINTPTR_MAX)) {
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            LOGW("guarded invalid memcmp a=%p b=%p n=%zu", a, b, n);
+        }
+        return 1;
     }
-    return r;
+    return real_memcmp(a, b, n);
 }
 
 static int hook_sync_wait(int fd, int timeout_ms) {
@@ -1620,6 +2639,16 @@ static int hook_gb_lock(void* self, uint32_t usage, void** out, int32_t* a, int3
     int r = real_gb_lock(self, usage, out, a, b);
     uint64_t us = (now_ns() - t0) / 1000;
     stat_add(&g_st_gblock, us);
+    if (r == 0 && usage == 0x30 && g_xproc_vendor && t_job.active) {
+        const int fd = vendor_resolve_job_dst_fd(t_job.self, self);
+        if (fd >= 0) {
+            if (t_job.dst_fd >= 0) close(t_job.dst_fd);
+            t_job.dst_fd = fd;
+            fd_identity(fd, &t_job.dst_dev, &t_job.dst_ino);
+            if (g_log >= 1 && g_st_gray.n <= 4)
+                LOGI("xproc exact output GraphicBuffer matched dst_fd=%d", fd);
+        }
+    }
     if (g_log >= 1 && (g_st_gblock.n % 40) == 0)
         LOGI("GraphicBuffer::lock usage=0x%x %lluus (calls=%llu avg=%lluus max=%lluus) ret=%d",
              usage, (unsigned long long)us, (unsigned long long)g_st_gblock.n,
@@ -1630,10 +2659,70 @@ static int hook_gb_lock(void* self, uint32_t usage, void** out, int32_t* a, int3
 
 static void* hook_memcpy(void* dst, const void* src, size_t n) {
     uint64_t t0 = now_ns();
-    if (g_skipcopy && n == 4147200) {
+    if (g_damagecopy && n == 4147200) {
+        static int damagecopy_probe;
+        if (g_log >= 1 && (damagecopy_probe++ < 8 || (g_st_memcpy.n % 20) == 0)) {
+            Rect pq;
+            pthread_mutex_lock(&g_lock);
+            pq = g_pend_ct;
+            pthread_mutex_unlock(&g_lock);
+            LOGI("damagecopy probe pending=(%d,%d,%d,%d)/%d", pq.l, pq.t, pq.r, pq.b,
+                 g_pend_ct_rects);
+        }
+        // The vendor normally reads the full uncached 1440x720 RGBA client target
+        // into its cached staging buffer. SF now supplies valid CT damage, so keep
+        // the previous staging contents outside the damaged rectangle and copy
+        // only the changed pixels. The vendor's converter/diff then sees a complete
+        // frame, but the expensive uncached read is proportional to damage.
+        Rect q;
+        pthread_mutex_lock(&g_lock);
+        q = g_pend_ct;
+        pthread_mutex_unlock(&g_lock);
+        constexpr int W = 1440, H = 720;
+        constexpr size_t PITCH = (size_t)W * 4;
+        if (!rect_empty(q)) {
+            if (q.l < 0) q.l = 0;
+            if (q.t < 0) q.t = 0;
+            if (q.r >= W) q.r = W - 1;
+            if (q.b >= H) q.b = H - 1;
+            const int x0 = q.l * 4;
+            const int x1 = (q.r + 1) * 4;
+            const size_t bytes = (size_t)(x1 - x0) * (size_t)(q.b - q.t + 1);
+            if (bytes > 0 && bytes < n) {
+                for (int y = q.t; y <= q.b; y++) {
+                    real_memcpy((uint8_t*)dst + (size_t)y * PITCH + x0,
+                                (const uint8_t*)src + (size_t)y * PITCH + x0,
+                                (size_t)(x1 - x0));
+                }
+                __atomic_add_fetch(&g_damagecopy_hits, 1, __ATOMIC_RELAXED);
+                __atomic_add_fetch(&g_damagecopy_bytes, bytes, __ATOMIC_RELAXED);
+                __atomic_add_fetch(&g_damagecopy_full_bytes, n, __ATOMIC_RELAXED);
+                if (g_log >= 2)
+                    LOGI("damagecopy rect=(%d,%d,%d,%d) bytes=%zu/%zu", q.l, q.t, q.r, q.b,
+                         bytes, n);
+                return dst;
+            }
+        }
+    }
+    bool xproc_job = false;
+    if (n == 4147200 && g_xproc_vendor && t_job.active && t_job.matched &&
+        !xproc_circuit_open() && xproc_mode_is_fast()) {
+        if (!wait_fence(t_job.snap.fence, g_fast_wait_ms)) {
+            if (g_log >= 1 && (g_st_memcpy.n <= 4 || (g_st_memcpy.n % 60) == 0))
+                LOGW("xproc staging copy not skipped: job fence not signalled");
+        } else {
+            xproc_job = true;
+            t_job.fence_waited = true;
+        }
+    }
+    const bool skip_ok = xproc_job || (g_skipcopy && !g_xproc_vendor);
+    if (skip_ok && n == 4147200) {
         // The vendor copies the whole RGBA client target into a staging buffer
         // and then overwrites that buffer with the converted gray. Skip only the
-        // exact redundant copy; everything else is untouched.
+        // exact redundant copy; everything else is untouched. Record that this
+        // particular job has no valid staging copy so a helper failure uses the
+        // bound client target directly instead of reading stale memory.
+        if (xproc_job) t_job.copy_skipped = true;
         __atomic_add_fetch(&g_skipcopy_hits, 1, __ATOMIC_RELAXED);
         return dst;
     }
@@ -1650,6 +2739,12 @@ static void* hook_memcpy(void* dst, const void* src, size_t n) {
 }
 
 static int64_t hook_process_image(void* self, void* param, void* ci) {
+    // Once the helper path has committed successfully, the vendor's asynchronous
+    // worker has no output to consume. Skip its full 4 MB staging copy as well as
+    // its conversion; otherwise it would compete with SF/helper on the same CPU.
+    if (g_xproc && !g_xproc_vendor &&
+            __atomic_load_n(&g_fast_active, __ATOMIC_RELAXED)) return 0;
+    job_begin(self, param, ci);
     // CommitInfo+0x54 is the pixel format the whole e-ink pipeline uses
     // (ComposerHandler::process copies it from the job; triggerEinkCommit puts it
     // in the ioctl; processImage and convertLayerToGray branch on it). Zero means
@@ -1674,10 +2769,14 @@ static int64_t hook_process_image(void* self, void* param, void* ci) {
         LOGI("processImage %lluus (n=%llu avg=%lluus max=%lluus)",
              (unsigned long long)us, (unsigned long long)g_st_pi.n,
              (unsigned long long)stat_avg(&g_st_pi), (unsigned long long)g_st_pi.max_us);
+    job_end();
     return r;
 }
 
 static int64_t hook_convert_layer_gray(void* self, void* param, void* ci) {
+    if (g_xproc && !g_xproc_vendor &&
+            __atomic_load_n(&g_fast_active, __ATOMIC_RELAXED)) return 0;
+    job_begin(self, param, ci);
     uint64_t t0 = now_ns();
     int64_t r = real_convert_layer_gray ? real_convert_layer_gray(self, param, ci) : 0;
     uint64_t us = (now_ns() - t0) / 1000;
@@ -1686,6 +2785,7 @@ static int64_t hook_convert_layer_gray(void* self, void* param, void* ci) {
         LOGI("convertLayerToGray %lluus (n=%llu avg=%lluus max=%lluus)",
              (unsigned long long)us, (unsigned long long)g_st_clg.n,
              (unsigned long long)stat_avg(&g_st_clg), (unsigned long long)g_st_clg.max_us);
+    job_end();
     return r;
 }
 
@@ -1709,6 +2809,89 @@ static void hook_convert_to_gray(void* src, void* dst, AndRect rect, int stride,
              (unsigned long long)g_conv_calls, src, dst, rect.l, rect.t, rect.r, rect.b,
              stride, bpp, src == dst, g_fastconv, g_ctsrc);
 
+    if (g_xproc_vendor && t_job.active && (t_job.helper_done || t_job.helper_ambiguous)) return;
+    if (g_xproc_vendor && src != dst && w > 0 && h > 0 && stride >= w * 4) {
+        const bool fast_mode = xproc_mode_is_fast();
+        const int dst_pitch = g_conv_dst_pitch > 0 ? g_conv_dst_pitch : stride / 4;
+        uint8_t* dst_ptr = (uint8_t*)dst + (size_t)rect.t * dst_pitch + (size_t)rect.l;
+        if (!t_job.active) {
+            if (g_log >= 1 && g_st_gray.n <= 4)
+                LOGW("xproc vendor conversion skipped: no active job binding");
+        } else if (!t_job.matched) {
+            if (g_log >= 1 && g_st_gray.n <= 4)
+                LOGW("xproc vendor conversion skipped: job client target has no snapshot");
+        } else if (t_job.snap.w != w || t_job.snap.h != h || !t_job.snap.handle) {
+            if (g_log >= 1 && g_st_gray.n <= 4)
+                LOGW("xproc vendor conversion skipped: geometry mismatch (%dx%d vs %dx%d)",
+                     t_job.snap.w, t_job.snap.h, w, h);
+        } else if (fast_mode && t_job.dst_fd >= 0 &&
+                   !dest_quarantined_fd(t_job.dst_fd)) {
+            if (!wait_fence(t_job.snap.fence, g_fast_wait_ms)) {
+                if (g_log >= 1 && (g_st_gray.n <= 4 || (g_xproc_fails % 20) == 0))
+                    LOGW("xproc job fence not signalled in %dms; vendor converter stays in charge",
+                         g_fast_wait_ms);
+            } else {
+                t_job.fence_waited = true;
+                const uint32_t vm = __atomic_load_n(&g_vendor_mode, __ATOMIC_RELAXED);
+                const uint32_t mode = g_mode >= 0 ? (uint32_t)g_mode
+                                      : (g_global_mode >= 0 ? (uint32_t)g_global_mode
+                                         : (vm != 0xffffffff ? vm : 0x11));
+                int out_pitch = 0;
+                bool ambiguous = false;
+                const uint64_t t0 = now_ns();
+                int fd = xproc_convert(t_job.snap, mode, &out_pitch, true, nullptr,
+                                       t_job.dst_fd, &ambiguous,
+                                       t_job.damage_valid ? Rect{ t_job.damage_l, t_job.damage_t,
+                                                                   t_job.damage_r, t_job.damage_b }
+                                                          : Rect{ 0, 0, -1, -1 });
+                if (fd >= 0) {
+                    close(fd);
+                    t_job.helper_done = true;
+                    __atomic_store_n(&g_xproc_ready, 1, __ATOMIC_RELAXED);
+                    const uint64_t us = (now_ns() - t0) / 1000;
+                    stat_add(&g_st_gray, us);
+                    if (g_log >= 1 && (g_st_gray.n <= 4 || (g_st_gray.n % 20) == 0))
+                        LOGI("xproc vendor convert+raw-copy %lluus (n=%llu avg=%lluus max=%lluus)",
+                             (unsigned long long)us, (unsigned long long)g_st_gray.n,
+                             (unsigned long long)stat_avg(&g_st_gray),
+                             (unsigned long long)g_st_gray.max_us);
+                    return;
+                }
+                if (g_log >= 1)
+                    LOGW("xproc vendor conversion failed%s; restoring vendor converter",
+                         ambiguous ? " (destination quarantined)" : "");
+                if (ambiguous) {
+                    // The helper may still be writing this destination. Do not
+                    // race it with the CPU fallback; drop this commit instead.
+                    pthread_mutex_lock(&g_lock);
+                    g_drop_next_commit = true;
+                    t_job.helper_ambiguous = true;
+                    pthread_mutex_unlock(&g_lock);
+                    if (g_log >= 1)
+                        LOGE("xproc request outcome ambiguous; dropping next commit");
+                    return;
+                }
+            }
+        }
+        // If the staging copy was skipped, convert the same job's snapshot
+        // directly into the vendor's locked destination buffer (`dst`).
+        if (t_job.copy_skipped) {
+            if (job_direct_fallback(dst_ptr, w, h, dst_pitch)) {
+                t_job.helper_done = true;
+                __atomic_add_fetch(&g_xproc_fails, 1, __ATOMIC_RELAXED);
+                if (g_log >= 1)
+                    LOGW("xproc failed; used same-frame CPU fallback from bound snapshot");
+                return;
+            }
+            pthread_mutex_lock(&g_lock);
+            g_drop_next_commit = true;
+            pthread_mutex_unlock(&g_lock);
+            if (g_log >= 1)
+                LOGE("xproc fallback unavailable; dropping next commit");
+            return;
+        }
+    }
+
     if (!g_fastconv || !src || !dst || w <= 0 || h <= 0 || stride < w * 4) {
         if (real_convert_to_gray) real_convert_to_gray(src, dst, rect, stride, bpp);
         return;
@@ -1721,10 +2904,11 @@ static void hook_convert_to_gray(void* src, void* dst, AndRect rect, int stride,
     bool mapped = false;
     bool mapper_locked = false;
     const native_handle_t* imp_used = nullptr;
-    CtSnap snap = { -1, -1, 0, 0, 0, 0, 0, false };
+    SnapLease snap_lease;
+    CtSnap& snap = snap_lease.snap;
     if (g_skipcopy && g_ctsrc) {
         pthread_mutex_lock(&g_lock);
-        snap = g_snap;
+        ct_snap_clone_locked(g_snap, &snap);
         pthread_mutex_unlock(&g_lock);
         if (snap.valid && snap.w == w && snap.h == h) {
             // The mapper import + lock gives the cached mapping (2.2 ms / 4 MB).
@@ -1773,12 +2957,22 @@ static void hook_convert_to_gray(void* src, void* dst, AndRect rect, int stride,
     uint8_t* d = (uint8_t*)dst + (size_t)rect.t * dp + (size_t)rect.l;
     // 1-bit modes: the kernel does not dither A2/Hyper/Extreme, so a mid-grey
     // would be a partial drive. Dither to pure black/white instead.
-    uint32_t vlo = g_vendor_mode & 0xff;
+    uint32_t vlo = __atomic_load_n(&g_vendor_mode, __ATOMIC_RELAXED) & 0xff;
     bool onebit = g_dither1 &&
                   (vlo == 0x10 || vlo == 0x11 || vlo == 0xb3 || vlo == 0xb7);
 
+    auto release_source = [&]() {
+        if (mapper_locked && imp_used) {
+            if (g_gbm && p_gbm_unlock) p_gbm_unlock(g_gbm, imp_used);
+        } else if (mapped) {
+            ct_unmap_sync(snap, false);
+        }
+        mapped = false;
+        mapper_locked = false;
+    };
+
     if (g_verify && src != dst) {
-        if (!real_convert_to_gray) return;
+        if (!real_convert_to_gray) { release_source(); return; }
         real_convert_to_gray(src, dst, rect, stride, bpp);      // the reference
         size_t need = (size_t)dp * (size_t)h;
         if (!g_verify_buf || g_verify_len < need) {
@@ -1786,7 +2980,7 @@ static void hook_convert_to_gray(void* src, void* dst, AndRect rect, int stride,
             g_verify_buf = (uint8_t*)malloc(need);
             g_verify_len = g_verify_buf ? need : 0;
         }
-        if (!g_verify_buf) return;
+        if (!g_verify_buf) { release_source(); return; }
         memcpy(g_verify_buf, dst, need);
         memset(dst, 0, need);                                    // make mistakes visible
         gray_conv((uint8_t*)dst, (uint8_t*)src, w, h, stride, dp, false);
@@ -1807,14 +3001,14 @@ static void hook_convert_to_gray(void* src, void* dst, AndRect rect, int stride,
                  dp, w, h, stride, n ? (double)sum / (double)n : 0.0, mx,
                  (unsigned long long)bad, (unsigned long long)n);
         memcpy(dst, g_verify_buf, need);                          // keep the vendor's output
+        release_source();
         return;
     }
 
     uint64_t t0 = now_ns();
     gray_conv(d, sp, w, h, spitch, dp, onebit);
     uint64_t us = (now_ns() - t0) / 1000;
-    if (mapper_locked && imp_used) { if (g_gbm && p_gbm_unlock) p_gbm_unlock(g_gbm, imp_used); }
-    else if (mapped) ct_unmap_sync(snap, false);
+    release_source();
     stat_add(&g_st_conv, us);
     if (g_log >= 1 && (g_st_conv.n % 40) == 0)
         LOGI("fastconv %lluus (n=%llu avg=%lluus max=%lluus) %dx%d pitch=%d/%d dst=%p src=%p",
@@ -2040,8 +3234,8 @@ static int shim_open(const hw_module_t* /*module*/, const char* name, hw_device_
     __android_log_print(ANDROID_LOG_INFO, TAG, "shim_open entered (name=%s)", name ? name : "?");
     read_knobs();
     int disabled = prop_int("vendor.debug.hwc.shim.disable", 0);
-    LOGI("hwcshim mt6765: log=%d rect=%d mode=%d src=%d xform=%d disabled=%d fast=%d inplace=%d diff=%d vend_hz=%d skipconv=%d fastgray=%d",
-         g_log, g_rect, g_mode, g_src, g_xform, disabled, g_fast, g_inplace, g_fast_diff, g_vend_hz, g_skipconv, g_fastgray);
+    LOGI("hwcshim mt6765: log=%d rect=%d mode=%d src=%d xform=%d disabled=%d fast=%d inplace=%d diff=%d vend_hz=%d skipconv=%d fastgray=%d damagecopy=%d",
+         g_log, g_rect, g_mode, g_src, g_xform, disabled, g_fast, g_inplace, g_fast_diff, g_vend_hz, g_skipconv, g_fastgray, g_damagecopy);
 
     // dlopen the real composer. Reject our own module: in the "replace" layout the
     // original path now points at the shim, and dlopening it would recurse.

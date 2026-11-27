@@ -1,5 +1,12 @@
 # Roadmap to 60 fps
 
+> **2026-11-27 result:** visible 60 fps is accepted with the reversible
+> `xproc_vendor=1` HWC/GPU-helper path: 600 physical vendor commits in 10 s
+> (60.0/s) after a clean reboot, zero fallbacks. See `STATUS.md`. The roadmap
+> below is retained as historical/fallback research.
+
+> **2026-11-24 audit correction:** the published Pro patch `0013` pre-quantizes pixels but keeps the client target RGBA_8888. It does **not** make the MT6765 composer copy 1 MB. See `SF-COMPATIBILITY-AUDIT.md`. The rebased core patch is useful for damage/quality work, but a true compact-buffer or damage-only vendor path is still required for 60 fps.
+
 The composer can already accept a full frame every 12.5–17.4 ms (`ret=0`). What it
 cannot do is *receive* the frame cheaply: the GSI's SurfaceFlinger hands it 4 MB of
 RGBA, and the vendor pipeline moves those 4 MB through a staging buffer (~33.5 ms).
@@ -8,7 +15,10 @@ Everything below attacks that, in order of expected payoff.
 ## Task 1 — SurfaceFlinger e-ink render pass (system image)
 
 **Goal:** the composer receives a frame that is already what the panel shows, and
-only the damaged region is copied.
+only the damaged region is copied. The published Pro patches achieve the first
+part (pixel values) but not the second (buffer size/damage-only vendor copy); measure
+`fmt`, `stride`, allocation size, and `processImage` before treating this as a 60 fps
+fix.
 
 Take the published patches from the HiBreak Pro LineageOS project and rebase them onto
 the GSI's Android 16 branch:

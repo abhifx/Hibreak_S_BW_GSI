@@ -19,6 +19,8 @@ import android.provider.Settings;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.BufferedReader;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 
 /**
  * Reproduces the stock PowerManager behaviour that the vendor composer needs
@@ -43,10 +45,18 @@ public class EinkDaemonService extends Service {
     private static final int NOTIFICATION_ID = 1001;
     private static final long PULSE_MS = 800;
     private static final long DEBOUNCE_MS = 900;
+    private static final long REAP_INTERVAL_MS = 30_000;
+    private static EinkDaemonService inputOwner;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private volatile long lastPulse;
+    private volatile long lastReap;
     private volatile boolean running;
+    private volatile Process touchProcess;
+    private volatile Process powerProcess;
+    private boolean bottomTouch;
+    private int lastTouchX = 360;
+    private long lastNavAssist;
 
     /** Stock Bigme 37-step LM3630A frontlight curve. */
     private static final int[] FL = {0, 2, 20, 30, 40, 50, 60, 70, 80, 90, 102, 108, 114,
@@ -99,8 +109,8 @@ public class EinkDaemonService extends Service {
         PowerManager pm = getSystemService(PowerManager.class);
         screenOn = pm != null && pm.isInteractive();
 
-        // Screen off: frontlight off + next lock wallpaper.
-        // Screen on: restore the saved brightness.
+        // Screen off: frontlight off + next lock wallpaper + reap zombie cgroups.
+        // Screen on: restore the saved brightness + reap zombie cgroups.
         screenOffReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
@@ -109,9 +119,11 @@ public class EinkDaemonService extends Service {
                     screenOn = false;
                     handler.removeCallbacks(brightnessApply);
                     writeBoth(0);
+                    reapEmptyCgroups();
                     handler.postDelayed(wallpaperNext, 250);
                 } else if (Intent.ACTION_SCREEN_ON.equals(action)) {
                     screenOn = true;
+                    reapEmptyCgroups();
                     if (getSharedPreferences("eink", MODE_PRIVATE)
                             .getBoolean("light_on", true)) {
                         handler.postDelayed(brightnessApply, 300);
@@ -125,7 +137,17 @@ public class EinkDaemonService extends Service {
         registerReceiver(screenOffReceiver, screenFilter);
 
         running = true;
-        new Thread(this::watchInput, "eink-getevent").start();
+        startInputWatchers(this);
+    }
+
+    private static synchronized void startInputWatchers(EinkDaemonService service) {
+        if (inputOwner != null && inputOwner.running) return;
+        inputOwner = service;
+        // Clean orphan readers from an earlier service instance/process. The
+        // anchored pattern cannot match the su wrapper or this shell command.
+        RootShell.get().query("pkill -f '^cat /dev/input/event[12]$' 2>/dev/null; echo cleaned", 2_000);
+        new Thread(service::watchInput, "eink-getevent").start();
+        new Thread(service::watchPowerKey, "eink-power-key").start();
     }
 
     @Override
@@ -141,6 +163,11 @@ public class EinkDaemonService extends Service {
     @Override
     public void onDestroy() {
         running = false;
+        synchronized (EinkDaemonService.class) {
+            if (inputOwner == this) inputOwner = null;
+        }
+        if (touchProcess != null) touchProcess.destroy();
+        if (powerProcess != null) powerProcess.destroy();
         handler.removeCallbacksAndMessages(null);
         if (brightnessObserver != null) {
             getContentResolver().unregisterContentObserver(brightnessObserver);
@@ -178,23 +205,26 @@ public class EinkDaemonService extends Service {
 
     private void writeBoth(int code) {
         android.util.Log.i("EINKBL", "writeBoth " + code);
-        Root.run("for ch in cold warm; do "
+        RootShell.get().cmd("for ch in cold warm; do "
                 + "P=$(ls /sys/devices/platform/*/i2c-*/2-0036/lm3630a_${ch}_light "
                 + "2>/dev/null | head -1); "
                 + "[ -n \"$P\" ] && echo " + code + " > \"$P\"; done");
+    }
+
+    /** Reclaim empty per-PID cgroup2 directories that pin ~900 KB of SUnreclaim slab each. */
+    private static void reapEmptyCgroups() {
+        RootShell.get().cmd("find /sys/fs/cgroup -mindepth 3 -maxdepth 3 -type d -name 'pid_*' -exec rmdir {} + 2>/dev/null");
     }
 
     private void watchInput() {
         while (running) {
             Process p = null;
             try {
-                // Kill readers left behind by a previous service instance; the
-                // su child is not always reaped by Process.destroy().
-                RootShell.get().cmd("pkill -f 'cat /dev/input/event' 2>/dev/null");
                 String node = findTouchNode();
                 android.util.Log.i("EINKD", "touch node=" + node);
                 p = Runtime.getRuntime().exec(new String[]{"su", "-c",
                         "cat /dev/input/" + node});
+                touchProcess = p;
                 InputStream in = p.getInputStream();
                 byte[] rec = new byte[24]; // 64-bit struct input_event
                 while (running) {
@@ -205,6 +235,7 @@ public class EinkDaemonService extends Service {
                         off += n;
                     }
                     if (off < rec.length) break;
+                    handleTouch(rec);
                     pulse();
                 }
             } catch (Exception e) {
@@ -223,20 +254,17 @@ public class EinkDaemonService extends Service {
     /** Resolve the touchscreen evdev node by name (fts_ts on this device). */
     private String findTouchNode() {
         try {
-            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c",
+            String out = RootShell.get().query(
                     "for d in /sys/class/input/event*; do "
-                    + "echo \"${d##*/} $(cat $d/device/name 2>/dev/null)\"; done"});
-            BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            String line;
+                    + "echo \"${d##*/} $(cat $d/device/name 2>/dev/null)\"; done", 5_000);
             String fallback = null;
-            while ((line = r.readLine()) != null) {
+            for (String line : out.split("\n")) {
                 String[] parts = line.trim().split("\\s+", 2);
                 if (parts.length < 2) continue;
                 String name = parts[1].toLowerCase();
                 if (fallback == null) fallback = parts[0];
                 if (name.contains("fts") || name.contains("touch")) return parts[0];
             }
-            p.waitFor();
             if (fallback != null) return fallback;
         } catch (Exception e) {
             android.util.Log.e("EINKD", "resolve failed: " + e);
@@ -244,10 +272,108 @@ public class EinkDaemonService extends Service {
         return "event2";
     }
 
+    private void watchPowerKey() {
+        while (running) {
+            Process p = null;
+            try {
+                String node = findPowerNode();
+                android.util.Log.i("EINKD", "power key node=" + node);
+                p = Runtime.getRuntime().exec(new String[]{"su", "-c",
+                        "cat /dev/input/" + node});
+                powerProcess = p;
+                InputStream in = p.getInputStream();
+                byte[] rec = new byte[24];
+                while (running) {
+                    int off = 0;
+                    while (off < rec.length) {
+                        int n = in.read(rec, off, rec.length - off);
+                        if (n < 0) break;
+                        off += n;
+                    }
+                    if (off < rec.length) break;
+                    ByteBuffer b = ByteBuffer.wrap(rec).order(ByteOrder.LITTLE_ENDIAN);
+                    b.position(16);
+                    int type = b.getShort() & 0xffff;
+                    int code = b.getShort() & 0xffff;
+                    int value = b.getInt();
+                    if (type == 1 && code == android.view.KeyEvent.KEYCODE_POWER && value == 1) {
+                        EinkAccessibilityService.notePowerKey();
+                    }
+                }
+            } catch (Exception e) {
+                android.util.Log.e("EINKD", "power-key watch failed: " + e);
+            } finally {
+                if (p != null) p.destroy();
+            }
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException e) {
+                return;
+            }
+        }
+    }
+
+    private String findPowerNode() {
+        try {
+            String out = RootShell.get().query(
+                    "for d in /sys/class/input/event*; do "
+                            + "echo \"${d##*/} $(cat $d/device/name 2>/dev/null)\"; done", 5_000);
+            String fallback = null;
+            for (String line : out.split("\n")) {
+                String[] parts = line.trim().split("\\s+", 2);
+                if (parts.length < 2) continue;
+                String name = parts[1].toLowerCase();
+                if (fallback == null && name.contains("key")) fallback = parts[0];
+                if (name.contains("pmic-key") || name.contains("gpio_key")) return parts[0];
+            }
+            if (fallback != null) return fallback;
+        } catch (Exception e) {
+            android.util.Log.e("EINKD", "power-node resolve failed: " + e);
+        }
+        return "event1";
+    }
+
+    private void handleTouch(byte[] rec) {
+        ByteBuffer b = ByteBuffer.wrap(rec).order(ByteOrder.LITTLE_ENDIAN);
+        b.position(16);
+        int type = b.getShort() & 0xffff;
+        int code = b.getShort() & 0xffff;
+        int value = b.getInt();
+        if (type == 1 && code == 330 && value == 0) { // BTN_TOUCH up
+            bottomTouch = false;
+            return;
+        }
+        if (type == 1 && code == 57 && value == -1) { // tracking id up
+            bottomTouch = false;
+            return;
+        }
+        if (type != 3) return;
+        if (code == 54) { // ABS_MT_POSITION_X
+            lastTouchX = value;
+            return;
+        }
+        if (code != 53) return; // ABS_MT_POSITION_Y
+        if (value > 1350 && !bottomTouch) {
+            bottomTouch = true;
+            long now = SystemClock.elapsedRealtime();
+            if (now - lastNavAssist > 3000 && lastTouchX > 80 && lastTouchX < 640) {
+                lastNavAssist = now;
+                EinkAccessibilityService.requestNavAssist();
+            }
+        } else if (value < 1200) {
+            bottomTouch = false;
+        }
+    }
+
     private void pulse() {
         long now = SystemClock.elapsedRealtime();
+        EinkAccessibilityService.noteUserActivity();
         if (now - lastPulse < DEBOUNCE_MS) return;
         lastPulse = now;
+        if (now - lastReap > REAP_INTERVAL_MS) {
+            lastReap = now;
+            reapEmptyCgroups();
+        }
         RootShell.get().cmd("setprop vendor.xrz.check_commit 1");
         handler.postDelayed(() ->
                         RootShell.get().cmd("setprop vendor.xrz.check_commit 0"),

@@ -10,7 +10,7 @@
 # into the device's "Device Parameters" key and re-enumerates the device.
 param(
     [string]$HardwareId = 'USB\VID_0E8D&PID_201C',
-    [string]$Serial = '<DEVICE-SERIAL>',
+    [string]$Serial = 'B531D1W2GFSA006000183',
     [switch]$NoAdbRestart
 )
 
